@@ -39,6 +39,18 @@ pub fn prose_grpprl() -> Vec<u8> {
     Vec::new()
 }
 
+/// List-item grpprl: `sprmPIlvl` (0x260A, 1-byte operand) for the level plus
+/// `sprmPIlfo` (0x460B, 2-byte operand) for the list format override id. Per
+/// [MS-DOC] §2.4.6.3 a paragraph is a list item only when its `ilfo` is a valid
+/// index, so both SPRMs are emitted; emitting only the level SPRM would make
+/// the walker (correctly) treat the paragraph as prose.
+#[allow(dead_code)]
+pub fn list_grpprl(ilvl: u8) -> Vec<u8> {
+    let mut g = vec![0x0A, 0x26, ilvl]; // sprmPIlvl
+    g.extend_from_slice(&[0x0B, 0x46, 0x01, 0x00]); // sprmPIlfo = 1
+    g
+}
+
 /// Cell paragraph grpprl: `sprmPFInTable` (0x2416)=1, `sprmPItap` (0x6649)=1.
 #[allow(dead_code)]
 pub fn cell_grpprl() -> Vec<u8> {

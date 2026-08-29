@@ -5,9 +5,9 @@ use crate::ir::*;
 /// Convert a parsed legacy `.doc` into the intermediate representation.
 ///
 /// When the FIB advertised a PlcfBtePapx, `DocDocument` carries structured
-/// paragraphs with PAP flags and we walk them in order to rebuild tables.
-/// Otherwise we fall back to a line-based heuristic over the sanitised text —
-/// the original `.doc` behaviour.
+/// paragraphs with PAP flags and we walk them in order to rebuild tables
+/// (and, eventually, lists). Otherwise we fall back to a line-based
+/// heuristic over the sanitised text — the original `.doc` behaviour.
 pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     let mut elements: Vec<Element> = Vec::new();
 
@@ -334,28 +334,84 @@ fn count_grid_edges(centers: &[i16], col: usize, grid: &[i32]) -> u32 {
     grid.iter().filter(|&&e| e >= lo && e < hi).count().max(1) as u32
 }
 
-/// Walk structured paragraphs in document order, emitting tables and prose.
+/// Walk structured paragraphs in document order, emitting tables, lists,
+/// and prose.
 ///
-/// Table rows are detected from `fInTable` paragraphs: a row-terminator
-/// paragraph (carrying `sprmTDefTable`) ends a row; a `\x07`-terminated
-/// paragraph closes a cell. Paragraphs outside any table run are emitted as
-/// prose (headings or paragraphs) via [`emit_prose`].
+/// List handling is a first cut: consecutive paragraphs that carry a list
+/// level SPRM (`0x460B` / `ilvl`) are grouped into one `Element::List`,
+/// with nesting driven by `ilvl`. The ordered-vs-bullet distinction and
+/// list-id (`ilfo`) grouping require the style table + PlcfLst/LSTF/LVL
+/// chain, which is out of scope here; lists therefore default to bullet
+/// (unordered). Lists whose `ilfo` is inherited only via a paragraph style
+/// (no direct SPRM) are not yet detected and fall through as prose — a
+/// graceful no-op rather than a regression.
+///
+/// `.doc` list levels are not guaranteed to start at 0 (Word writes the
+/// level as stored in the list definition, which may begin at 1), so each
+/// run's base level is taken as the minimum `ilvl` in that run — see
+/// `flush_list`.
+///
+/// A paragraph is a list item iff its `ilfo` (sprmPIlfo, `0x460B`) is a valid
+/// list index, per [MS-DOC] §2.4.6.3 ("If iLfoCur is zero, the paragraph is not
+/// part of a list"). The operand is decoded as a signed `i16`:
+/// `0x0000` / `0xF801` mean "not in a list"; `0x0001`–`0x07FE` are 1-based
+/// indices into `PlfLfo.rgLfo`; `0xF802`–`0xFFFF` are the negation of a 1-based
+/// index and are still list items. `None` (no sprmPIlfo) defaults to prose.
+fn is_doc_list_item(ilfo: Option<i16>) -> bool {
+    match ilfo {
+        None | Some(0) | Some(-2047) => false, // 0x0000 / 0xF801: not in a list
+        // TODO(ilfo-negated): 0xF802..=0xFFFF (i16 -2046..=-1) are list items
+        // whose `ilfo` is the negation of a 1-based index; resolve to the
+        // positive index when list-id grouping is implemented. Until then they
+        // must still be emitted as list items, not dropped to prose.
+        Some(v) if (1..=0x07FE).contains(&v) => true, // 0x0001..0x07FE normal
+        Some(v) if (-0x07FE..=-1).contains(&v) => true, // 0xF802..0xFFFF negated
+        _ => false,                                   // 0x07FF and other non-spec
+    }
+}
+
 fn walk_paragraphs(paragraphs: &[DocParagraph], elements: &mut Vec<Element>) {
     let mut table = TableBuilder::new();
+    let mut list_items: Vec<(u8, Vec<InlineContent>)> = Vec::new();
 
     for p in paragraphs {
         if p.props.is_table_trailing_mark {
+            flush_list(&mut list_items, elements);
             table.end_row(p.props.tap.clone(), p.props.itap);
         } else if p.props.f_in_table {
+            flush_list(&mut list_items, elements);
             table.add_cell_paragraph(p);
+        } else if is_doc_list_item(p.props.ilfo) {
+            // List membership is keyed on `ilfo` (sprmPIlfo, `0x460B`), not on
+            // `ilvl`: per [MS-DOC] §2.4.6.3 a paragraph is a list item only when
+            // its `ilfo` is a valid list index. `ilvl` still drives nesting.
+            table.flush(elements);
+            let ilvl = p.props.ilvl.unwrap_or(0);
+            list_items.push((ilvl, inline_content_for(&p.text)));
         } else {
             table.flush(elements);
-            // `p.props.tabs` is empty in the tables-only build (populated by the
-            // list/tab-stop PR); passing it through keeps the IR uniform.
+            flush_list(&mut list_items, elements);
             emit_prose(&p.text, &p.props.tabs, elements);
         }
     }
     table.flush(elements);
+    flush_list(&mut list_items, elements);
+}
+
+/// Emit the accumulated list run as an `Element::List` and clear it.
+fn flush_list(items: &mut Vec<(u8, Vec<InlineContent>)>, elements: &mut Vec<Element>) {
+    if items.is_empty() {
+        return;
+    }
+    // `.doc` list levels are not guaranteed to start at 0; use the shallowest
+    // level in this run as the base so a run whose top level is e.g. 1 is not
+    // collapsed by `build_nested_list` (which would otherwise treat every
+    // item as a child of the first and drop the rest when base_level is 0).
+    let base_level = items.iter().map(|(lvl, _)| *lvl).min().unwrap_or(0);
+    // `ordered = false` (bullet) — see `walk_paragraphs` for the limitation.
+    let list = build_nested_list(false, items, base_level);
+    elements.push(Element::List(list));
+    items.clear();
 }
 
 /// Turn a paragraph's text into inline content, preserving soft line breaks.
@@ -440,7 +496,9 @@ fn line_heuristic(text: &str, elements: &mut Vec<Element>) {
 mod tests {
     use super::*;
     use crate::doc::{DocParagraph, PapProps, TapCellInfo, TapInfo};
-    use crate::ir::{Element, InlineContent, Paragraph, TextSpan};
+    use crate::ir::{
+        Element, InlineContent, Paragraph, TabAlignment, TabLeader, TabStop, TextSpan,
+    };
 
     /// Build a `TapInfo` from column-center boundaries (twips).
     fn tap(centers: &[i16]) -> TapInfo {
@@ -558,6 +616,108 @@ mod tests {
                     ))
             )),
             "a nested-table notice must be emitted (no silent flattening)"
+        );
+    }
+
+    /// List membership is keyed on `ilfo` (`sprmPIlfo`, `0x460B`), per
+    /// [MS-DOC] §2.4.6.3. `0x0000` and `0xF801` mean "not in a list" and the
+    /// paragraph must be ordinary prose even when an `ilvl` SPRM is present.
+    #[test]
+    fn ilfo_not_in_list_bands_are_prose() {
+        // `0x0000` (0) and `0xF801` (-2047 as signed i16) are the two
+        // documented "not in a list" markers. A non-spec value (2047) is also
+        // prose because it falls outside every valid band.
+        for ilfo in [0i16, -2047, 2047] {
+            let props = PapProps {
+                ilvl: Some(0),
+                ilfo: Some(ilfo),
+                ..PapProps::default()
+            };
+            let p = para("Not a list item.", props);
+            let mut els = Vec::new();
+            walk_paragraphs(&[p], &mut els);
+            assert!(
+                !els.iter().any(|e| matches!(e, Element::List(_))),
+                "ilfo {ilfo:#06x} must not build a list"
+            );
+            assert!(
+                els.iter().any(|e| matches!(e, Element::Paragraph(_))),
+                "ilfo {ilfo:#06x} must be emitted as ordinary prose"
+            );
+        }
+    }
+
+    /// `0xF802`–`0xFFFF` is the negation of a 1-based index and is still a list
+    /// item (see TODO(ilfo-negated)); it must not be dropped to prose.
+    #[test]
+    fn ilfo_negated_band_is_list() {
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(-2046), // 0xF802
+            ..PapProps::default()
+        };
+        let p = para("A list item via the negated band.", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], &mut els);
+        assert!(
+            els.iter().any(|e| matches!(e, Element::List(_))),
+            "0xF802 (negated index) must still be a list item"
+        );
+    }
+
+    /// `sprmPChgTabs` tab stops decoded onto `PapProps` must surface on the
+    /// produced paragraph's `tabs`.
+    #[test]
+    fn pchg_tabs_surfaced_on_paragraph() {
+        let props = PapProps {
+            tabs: vec![TabStop {
+                position_twips: 1440,
+                alignment: TabAlignment::Center,
+                leader: TabLeader::None,
+            }],
+            ..PapProps::default()
+        };
+        let p = para("Indented text carrying tab stops.", props);
+
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], &mut els);
+        let Element::Paragraph(par) = &els[0] else {
+            panic!("expected a paragraph, got {:?}", els[0]);
+        };
+        assert_eq!(par.tabs.len(), 1, "decoded tab stops must reach the IR");
+        assert_eq!(par.tabs[0].position_twips, 1440);
+    }
+
+    /// A table cell's content is a paragraph flagged `f_in_table` (but not a row
+    /// terminator). `walk_paragraphs` must route it through
+    /// `table.add_cell_paragraph` (convert_doc.rs:362-363), the `f_in_table`
+    /// dispatch branch. A lone cell paragraph makes no row, so wrap it between
+    /// two row-terminators the way a real `.doc` lays out a one-cell table.
+    #[test]
+    fn in_table_paragraph_becomes_cell() {
+        let mark = |itap: u8| DocParagraph {
+            text: String::new(),
+            terminator: '\r',
+            props: PapProps {
+                is_table_trailing_mark: true,
+                itap,
+                ..PapProps::default()
+            },
+        };
+        let cell = DocParagraph {
+            text: "cell text".into(),
+            terminator: '\u{7}', // closes the cell
+            props: PapProps {
+                f_in_table: true,
+                ..PapProps::default()
+            },
+        };
+        let paragraphs = [mark(1), cell, mark(1)];
+        let mut els = Vec::new();
+        walk_paragraphs(&paragraphs, &mut els);
+        assert!(
+            els.iter().any(|e| matches!(e, Element::Table(_))),
+            "f_in_table cell paragraph must be emitted inside a table"
         );
     }
 
