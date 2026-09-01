@@ -17,7 +17,8 @@
 //! The `grpprl` is decoded by [`super::sprm::extract_pap_props`].
 
 use super::piece_table::{Piece, decode_cp_range, sanitize_text};
-use super::sprm::PapProps;
+use super::sprm::{PapProps, paragraph_style_istd};
+use super::styles::{StyleDef, heading_level_for_istd};
 
 /// A paragraph descriptor recovered from a PAPX FKP page.
 #[derive(Debug, Clone)]
@@ -28,6 +29,15 @@ pub struct FkpParagraph {
     pub fc_end: u32,
     /// The PAP `grpprl` bytes (without the `cw`/`istd` header).
     pub grpprl: Vec<u8>,
+    /// The paragraph style index (`istd`) from the PAPX header, before any
+    /// `sprmPStyle` (0x640A) override carried in the `grpprl`.
+    pub istd: u16,
+}
+
+/// Result of decoding one PAPX: its `grpprl` and the header `istd`.
+struct PapxData {
+    grpprl: Vec<u8>,
+    istd: u16,
 }
 
 /// A fully-resolved main-text paragraph: its raw text, the terminating
@@ -130,28 +140,36 @@ fn parse_fkp_page(page: &[u8], out: &mut Vec<FkpParagraph>) {
         let word_off = page[bx_off] as usize;
         let fc_start = rgfc[i];
         let fc_end = rgfc[i + 1];
-        let grpprl = if word_off == 0 {
-            Vec::new()
+        let papx = if word_off == 0 {
+            PapxData {
+                grpprl: Vec::new(),
+                istd: 0,
+            }
         } else {
             extract_grpprl(page, word_off)
         };
         out.push(FkpParagraph {
             fc_start,
             fc_end,
-            grpprl,
+            grpprl: papx.grpprl,
+            istd: papx.istd,
         });
     }
 }
 
-/// Extract the PAP `grpprl` from a page at the given word offset.
+/// Extract the PAP `grpprl` (and header `istd`) from a page at the given word
+/// offset.
 ///
 /// Layout: `[cw:1][istd:2][grpprl: cb-3]`, `cb = cw * 2`. The Word8 re-read
 /// (`cw == 0` → use the next byte) is applied so row-terminator paragraphs,
 /// which carry the full TAP, are not mistaken for empty PAPXs.
-fn extract_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
+fn extract_grpprl(page: &[u8], word_off: usize) -> PapxData {
     let mut p = word_off * 2;
     if p >= page.len() {
-        return Vec::new();
+        return PapxData {
+            grpprl: Vec::new(),
+            istd: 0,
+        };
     }
     let mut cw = page[p] as usize;
     let reread = cw == 0;
@@ -159,14 +177,26 @@ fn extract_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
         // Word8 re-read: the real cw is the following byte.
         p += 1;
         if p >= page.len() {
-            return Vec::new();
+            return PapxData {
+                grpprl: Vec::new(),
+                istd: 0,
+            };
         }
         cw = page[p] as usize;
     }
     let cb = cw * 2; // total PAPX bytes for the istd+grpprl block
     if cb < 3 {
-        return Vec::new(); // only cw + istd, no grpprl
+        return PapxData {
+            grpprl: Vec::new(),
+            istd: 0,
+        }; // only cw + istd, no grpprl
     }
+    // `istd` is the 2 bytes immediately after `cw` (post-reread), before grpprl.
+    let istd = if p + 3 <= page.len() {
+        u16::from_le_bytes([page[p + 1], page[p + 2]])
+    } else {
+        0
+    };
     let grpprl_start = p + 3; // skip cw (1) + istd (2)
     // Per MS-DOC §2.9.175 (PapxInFkp) the grpprl length differs by form:
     //  • cw != 0: grpprlInPapx *is* a GrpPrlAndIstd of `2*cw - 1` bytes, so the
@@ -177,9 +207,15 @@ fn extract_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
     //    truncate the trailing SPRM (e.g. the row's TAP).
     let grpprl_end = (p + cb + if reread { 1 } else { 0 }).min(page.len());
     if grpprl_start >= grpprl_end {
-        return Vec::new();
+        return PapxData {
+            grpprl: Vec::new(),
+            istd,
+        };
     }
-    page[grpprl_start..grpprl_end].to_vec()
+    PapxData {
+        grpprl: page[grpprl_start..grpprl_end].to_vec(),
+        istd,
+    }
 }
 
 /// Convert a character position to a real byte offset in the WordDocument
@@ -280,6 +316,7 @@ pub fn build_paragraphs(
     pieces: &[Piece],
     fkp: &[FkpParagraph],
     text_len: u32,
+    styles: &[StyleDef],
 ) -> Vec<DocParagraph> {
     let mut keyed: Vec<(u32, &FkpParagraph)> = fkp
         .iter()
@@ -304,7 +341,15 @@ pub fn build_paragraphs(
         }
         let terminator = chars[chars.len() - 1];
         let content: String = sanitize_text(&chars[..chars.len() - 1].iter().collect::<String>());
-        let props = super::sprm::extract_pap_props(&fp.grpprl);
+        let mut props = super::sprm::extract_pap_props(&fp.grpprl);
+        // Resolve the heading level from the paragraph's style. A `sprmPStyle`
+        // (0x640A) in the grpprl overrides the PAPX `istd`; otherwise use the
+        // PAPX `istd`. A `sprmPOutlineLvl` (0x6412) already sets
+        // `heading_level` directly and takes precedence when present.
+        let istd = paragraph_style_istd(&fp.grpprl).unwrap_or(fp.istd);
+        if props.heading_level.is_none() {
+            props.heading_level = heading_level_for_istd(styles, istd);
+        }
         out.push(DocParagraph {
             text: content,
             terminator,
@@ -319,6 +364,7 @@ mod tests {
     use super::*;
     use crate::doc::piece_table::Piece;
     use crate::doc::sprm::extract_pap_props;
+    use crate::doc::styles::StyleDef;
 
     fn unicode_piece(fc: u32, cp_end: u32) -> Piece {
         Piece {
@@ -410,6 +456,7 @@ mod tests {
             fc_start: 0x800 + cp0 * 2,
             fc_end: 0x800 + cp1 * 2,
             grpprl: grpprl.to_vec(),
+            istd: 0,
         };
         let cell = [0x16, 0x24, 0x01, 0x49, 0x66, 0x01, 0x00, 0x00, 0x00];
         let rowmark = [
@@ -423,7 +470,7 @@ mod tests {
             mk(5, 6, &rowmark), // "\u{7}" row mark
         ];
 
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6, &[]);
         assert_eq!(paras.len(), 4);
         // leading mark
         assert_eq!(paras[0].text, "");
@@ -460,10 +507,11 @@ mod tests {
             fc_start: 0x800 + cp0 * 2,
             fc_end: 0x800 + cp1 * 2,
             grpprl: Vec::new(),
+            istd: 0,
         };
         let fkp = vec![mk(0, 6), mk(6, 12)];
 
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12, &[]);
         assert_eq!(paras.len(), 2);
         assert_eq!(paras[0].text, "Hi 😀", "emoji must not desync the range");
         assert_eq!(paras[0].terminator, '\r');
@@ -486,9 +534,10 @@ mod tests {
             fc_start: 0x800 + cp0 * 2,
             fc_end: 0x800 + cp1 * 2,
             grpprl: Vec::new(),
+            istd: 0,
         };
         let fkp = vec![mk(0, raw.chars().count() as u32)];
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &[]);
         assert_eq!(paras.len(), 1);
         assert_eq!(paras[0].terminator, '\r');
         let t = &paras[0].text;
@@ -497,6 +546,42 @@ mod tests {
         assert!(!t.contains('\u{15}'), "field end must be stripped");
         assert!(t.contains("HYPERLINK"), "field result text survives");
         assert_eq!(t, "SeeHYPERLINKresulthere");
+    }
+
+    /// Regression: a paragraph whose PAPX `istd` points at a built-in `Heading N`
+    /// style (sti 1..9) must resolve to `heading_level == Some(N)` via the style
+    /// sheet, even when no `sprmPOutlineLvl` (0x6412) is present. This is the
+    /// style-sheet fallback path that replaces the line heuristic for styled
+    /// headings.
+    #[test]
+    fn build_paragraphs_resolves_heading_from_style_istd() {
+        let styles = vec![
+            StyleDef::default(), // istd 0: Normal
+            StyleDef::default(), // istd 1
+            StyleDef::default(), // istd 2
+            StyleDef {
+                sti: 3,
+                name: "Heading 3".into(),
+            }, // istd 3: built-in Heading 3
+        ];
+        let raw = "Subsection\r";
+        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
+        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
+        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
+        let fkp = [FkpParagraph {
+            fc_start: 0x800,
+            fc_end: 0x800 + raw.chars().count() as u32 * 2,
+            grpprl: Vec::new(),
+            istd: 3,
+        }];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(
+            paras[0].props.heading_level,
+            Some(3),
+            "built-in Heading style must resolve to its level"
+        );
     }
 
     /// Regression: the `cw == 0` Word8 re-read branch must not drop the trailing
@@ -532,7 +617,7 @@ mod tests {
         page[4..4 + 32].copy_from_slice(&grpprl);
 
         let extracted = extract_grpprl(&page, 0);
-        let props = extract_pap_props(&extracted);
+        let props = extract_pap_props(&extracted.grpprl);
         assert!(
             props.tap.is_some(),
             "cw==0 re-read must keep the full grpprl so the trailing TAP parses"

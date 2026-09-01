@@ -391,7 +391,7 @@ fn walk_paragraphs(paragraphs: &[DocParagraph], elements: &mut Vec<Element>) {
         } else {
             table.flush(elements);
             flush_list(&mut list_items, elements);
-            emit_prose(&p.text, &p.props.tabs, elements);
+            emit_prose(&p.text, &p.props.tabs, p.props.heading_level, elements);
         }
     }
     table.flush(elements);
@@ -442,11 +442,38 @@ fn inline_content_for(text: &str) -> Vec<InlineContent> {
 
 /// Classify a prose paragraph as a heading or paragraph and push it.
 ///
-/// Mirrors the line-based heuristic so a PAPX-bearing document keeps the same
-/// heading/title detection as the fallback path.
-fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
+/// When `heading_level` is `Some`, the paragraph is a styled heading and its
+/// real level is used directly (resolved from `sprmPOutlineLvl` or the
+/// paragraph's style in the document style sheet — see `crate::doc::styles`).
+/// Otherwise the line-based heuristic is applied, keeping a PAPX-bearing
+/// document's heading/title detection identical to the fallback path.
+fn emit_prose(
+    text: &str,
+    tabs: &[TabStop],
+    heading_level: Option<u8>,
+    elements: &mut Vec<Element>,
+) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
+        return;
+    }
+
+    // A styled heading uses its real level, overriding the heuristic.
+    if let Some(level) = heading_level {
+        let mut content = inline_content_for(trimmed);
+        for ic in &mut content {
+            if let InlineContent::Text(t) = ic {
+                t.bold = true;
+            }
+        }
+        elements.push(Element::Heading(Heading {
+            // MS-DOC outline levels are 1-based and run to 9, but
+            // `Heading::level` is a 1–6 markdown-style depth; clamp, matching
+            // the DOCX path's `(outline_level + 1).min(6)`.
+            level: level.min(6),
+            content,
+            ..Default::default()
+        }));
         return;
     }
 
@@ -488,7 +515,7 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
 
 fn line_heuristic(text: &str, elements: &mut Vec<Element>) {
     for line in text.lines() {
-        emit_prose(line, &[], elements);
+        emit_prose(line, &[], None, elements);
     }
 }
 

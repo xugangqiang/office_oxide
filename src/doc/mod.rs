@@ -16,6 +16,7 @@ pub mod images;
 mod papx;
 mod piece_table;
 mod sprm;
+pub mod styles;
 
 pub use crate::core::OfficeDocument;
 pub use document::DocDocument;

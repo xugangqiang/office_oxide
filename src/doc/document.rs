@@ -9,6 +9,7 @@ use super::fib::Fib;
 use super::images::{DocImage, extract_images};
 use super::papx::{DocParagraph, build_paragraphs, parse_papx_paragraphs};
 use super::piece_table::{extract_text, parse_clx, sanitize_text};
+use super::styles::{StyleDef, parse_style_sheet};
 
 /// A parsed legacy Word document.
 #[derive(Debug)]
@@ -105,7 +106,12 @@ impl DocDocument {
                 fib.fc_plcf_bte_papx,
                 fib.lcb_plcf_bte_papx,
             );
-            build_paragraphs(&word_doc, &pieces, &fkp, fib.text_len)
+            // Parse the style sheet so paragraph styles (incl. built-in
+            // Heading 1-9 and user-defined "Heading N") can be resolved to a
+            // real heading level. A malformed/absent sheet yields an empty
+            // list and headings fall back to the line heuristic.
+            let styles: Vec<StyleDef> = parse_style_sheet(&table_stream, &fib);
+            build_paragraphs(&word_doc, &pieces, &fkp, fib.text_len, &styles)
         } else {
             Vec::new()
         };
@@ -329,6 +335,55 @@ mod tests {
         use crate::ir::Element;
         let ir = crate::convert_doc::doc_to_ir(&make_doc("Title\nSECTION TWO\nBody text."));
         assert!(matches!(ir.sections[0].elements[1], Element::Heading(ref h) if h.level == 2));
+    }
+
+    #[test]
+    fn ir_styled_heading_uses_real_level() {
+        use crate::ir::Element;
+        // A styled "Heading 3" paragraph that is NOT the first element must
+        // keep its real level (3) instead of collapsing to the heuristic level
+        // 2 (the `elements.is_empty() ? 1 : 2` rule in `emit_prose`). This is
+        // the regression test for deriving heading levels from paragraph style
+        // rather than the line heuristic.
+        let doc = make_doc_with_paragraphs(vec![
+            pap("Intro paragraph.", Default::default()),
+            pap(
+                "Subsection",
+                crate::doc::sprm::PapProps {
+                    heading_level: Some(3),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        let elements = &ir.sections[0].elements;
+        assert!(matches!(elements[0], Element::Paragraph(_)));
+        match &elements[1] {
+            Element::Heading(h) => {
+                assert_eq!(h.level, 3, "styled heading must keep its real level")
+            },
+            other => panic!("expected a Heading, got {:?}", other),
+        }
+    }
+
+    /// Regression: MS-DOC outline levels run 1–9 but `Heading::level` is a
+    /// 1–6 markdown depth, so a deeply-nested heading must clamp to 6 rather
+    /// than emitting an out-of-contract level.
+    #[test]
+    fn ir_deep_outline_level_clamps_to_six() {
+        use crate::ir::Element;
+        let doc = make_doc_with_paragraphs(vec![pap(
+            "Deep section",
+            crate::doc::sprm::PapProps {
+                heading_level: Some(9),
+                ..Default::default()
+            },
+        )]);
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        match &ir.sections[0].elements[0] {
+            Element::Heading(h) => assert_eq!(h.level, 6, "outline level 9 must clamp to 6"),
+            other => panic!("expected a Heading, got {:?}", other),
+        }
     }
 
     #[test]
