@@ -362,9 +362,10 @@ pub fn build_paragraphs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doc::fib::Fib;
     use crate::doc::piece_table::Piece;
     use crate::doc::sprm::extract_pap_props;
-    use crate::doc::styles::StyleDef;
+    use crate::doc::styles::{StyleDef, parse_style_sheet};
 
     fn unicode_piece(fc: u32, cp_end: u32) -> Piece {
         Piece {
@@ -655,6 +656,100 @@ mod tests {
             paras[0].props.heading_level,
             Some(3),
             "user-defined `heading N` name must resolve to its level"
+        );
+    }
+
+    /// A 4-style STSH (indices 0..3): `Normal`, two empty slots, and a built-in
+    /// `Heading 3` (sti 3). Mirrors the layout `parse_stsh` expects: an 18-byte
+    /// Stshif (cstd = 4), a style-name STTB, then 4 LPStd entries.
+    fn stsh_with_heading_3() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&18u16.to_le_bytes()); // cbStshi
+        d.extend_from_slice(&4u16.to_le_bytes()); // cstd = 4
+        d.extend_from_slice(&10u16.to_le_bytes()); // cbSTDBaseInFile
+        d.extend_from_slice(&[0u8; 14]); // remainder of the 18-byte Stshif
+        // Style-name STTB (f2 = 1, cData = 4, cbData = 0).
+        d.push(1);
+        d.extend_from_slice(&4u16.to_le_bytes());
+        d.extend_from_slice(&0u16.to_le_bytes());
+        for name in ["Normal", "", "", "Heading 3"] {
+            if name.is_empty() {
+                d.extend_from_slice(&0u16.to_le_bytes());
+            } else {
+                d.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                for c in name.encode_utf16() {
+                    d.extend_from_slice(&c.to_le_bytes());
+                }
+            }
+        }
+        d.extend_from_slice(&0u16.to_le_bytes()); // trailing null string
+        // 4 LPStd entries: cbStd = 10 + StdfBase (sti in low 2 bytes).
+        for &sti in &[0u16, 0u16, 0u16, 3u16] {
+            d.extend_from_slice(&10u16.to_le_bytes());
+            d.extend_from_slice(&sti.to_le_bytes());
+            d.extend_from_slice(&[0u8; 8]);
+        }
+        d
+    }
+
+    fn fib_with_stsh(start: u32, len: u32) -> Fib {
+        Fib {
+            version: 0,
+            use_table1: false,
+            clx_offset: 0,
+            clx_size: 0,
+            text_len: 0,
+            footnote_len: 0,
+            header_len: 0,
+            comment_len: 0,
+            endnote_len: 0,
+            textbox_len: 0,
+            header_textbox_len: 0,
+            fc_plcf_bte_papx: 0,
+            lcb_plcf_bte_papx: 0,
+            fc_plcf_lst: 0,
+            lcb_plcf_lst: 0,
+            fc_stshf: start,
+            lcb_stshf: len,
+        }
+    }
+
+    /// Integration: drive the FIB-aware `parse_style_sheet` (the call
+    /// `document.rs` makes) and feed its result into `build_paragraphs`, exactly
+    /// as the real `.doc` walk does — but with a synthetic Table stream instead
+    /// of a parsed CFB. The POI corpus cannot exercise this (every file reports
+    /// `fc_stshf == 0`), so this is the regression guard that stands in for a
+    /// "real .doc with a style sheet": a paragraph styled `Heading 3` (istd 3)
+    /// must resolve to level 3 through the full byte-to-IR pipeline.
+    #[test]
+    fn build_paragraphs_resolves_heading_from_parsed_style_sheet() {
+        let stsh = stsh_with_heading_3();
+        let start = 64usize;
+        let mut table_stream = vec![0u8; start + stsh.len()];
+        table_stream[start..start + stsh.len()].copy_from_slice(&stsh);
+        let fib = fib_with_stsh(start as u32, stsh.len() as u32);
+        let styles = parse_style_sheet(&table_stream, &fib);
+        assert_eq!(styles.len(), 4);
+        assert_eq!(styles[3].sti, 3);
+        assert_eq!(styles[3].name, "Heading 3");
+
+        let raw = "Subsection\r";
+        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
+        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
+        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
+        let fkp = [FkpParagraph {
+            fc_start: 0x800,
+            fc_end: 0x800 + raw.chars().count() as u32 * 2,
+            grpprl: Vec::new(),
+            istd: 3,
+        }];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(
+            paras[0].props.heading_level,
+            Some(3),
+            "heading must resolve from a style sheet obtained via parse_style_sheet"
         );
     }
 

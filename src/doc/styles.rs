@@ -268,4 +268,63 @@ mod tests {
         assert!(parse_stsh(&[0u8; 4]).is_empty());
         assert!(parse_stsh(&[18, 0, 0, 0]).is_empty());
     }
+
+    /// Build a `Fib` whose only non-zero fields are `fc_stshf` / `lcb_stshf`,
+    /// pointing at a style sheet in the Table stream.
+    fn fib_with_stsh(start: u32, len: u32) -> Fib {
+        Fib {
+            version: 0,
+            use_table1: false,
+            clx_offset: 0,
+            clx_size: 0,
+            text_len: 0,
+            footnote_len: 0,
+            header_len: 0,
+            comment_len: 0,
+            endnote_len: 0,
+            textbox_len: 0,
+            header_textbox_len: 0,
+            fc_plcf_bte_papx: 0,
+            lcb_plcf_bte_papx: 0,
+            fc_plcf_lst: 0,
+            lcb_plcf_lst: 0,
+            fc_stshf: start,
+            lcb_stshf: len,
+        }
+    }
+
+    /// `parse_style_sheet` is the FIB-aware wrapper that `document.rs` calls: it
+    /// must slice the STSH out of the Table stream at `fc_stshf` (bounds-checked)
+    /// and hand the bytes to `parse_stsh`. This exercises the wrapper end-to-end
+    /// with real STSH bytes placed at a non-zero offset — the path the POI corpus
+    /// never reaches (every file reports `fc_stshf == 0`).
+    #[test]
+    fn parse_style_sheet_reads_stsh_at_fib_offset() {
+        let stsh = synthetic_stsh();
+        let start = 64usize;
+        let mut table_stream = vec![0u8; start + stsh.len()];
+        table_stream[start..start + stsh.len()].copy_from_slice(&stsh);
+        let fib = fib_with_stsh(start as u32, stsh.len() as u32);
+        let styles = parse_style_sheet(&table_stream, &fib);
+        assert_eq!(styles.len(), 3);
+        assert_eq!(styles[0].sti, 0);
+        assert_eq!(styles[0].name, "Normal");
+        assert_eq!(styles[1].sti, 1);
+        assert_eq!(styles[1].name, "Heading 1");
+        assert_eq!(styles[2].sti, 0x0FFE);
+        assert_eq!(styles[2].name, "Heading 2");
+    }
+
+    #[test]
+    fn parse_style_sheet_absent_is_empty() {
+        let table_stream = vec![0u8; 64];
+        assert!(parse_style_sheet(&table_stream, &fib_with_stsh(0, 0)).is_empty());
+    }
+
+    #[test]
+    fn parse_style_sheet_out_of_bounds_is_empty() {
+        let stsh = synthetic_stsh();
+        // Point `fc_stshf` past the end of the table stream.
+        assert!(parse_style_sheet(&stsh, &fib_with_stsh(1000, stsh.len() as u32)).is_empty());
+    }
 }
