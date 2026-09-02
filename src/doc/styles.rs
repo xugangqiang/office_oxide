@@ -30,7 +30,13 @@ pub fn parse_style_sheet(table_stream: &[u8], fib: &Fib) -> Vec<StyleDef> {
         return Vec::new();
     }
     let start = fib.fc_stshf as usize;
-    let end = (start + fib.lcb_stshf as usize).min(table_stream.len());
+    // `saturating_add` so a malformed `fc_stshf`/`lcb_stshf` (e.g. near
+    // `u32::MAX`) cannot overflow the pointer arithmetic on 32-bit targets;
+    // on 64-bit the sum already fits, but the contract is "no overflow, ever"
+    // (AGENTS.md rule 6).
+    let end = start
+        .saturating_add(fib.lcb_stshf as usize)
+        .min(table_stream.len());
     if start >= table_stream.len() || end <= start {
         return Vec::new();
     }
