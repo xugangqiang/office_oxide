@@ -584,6 +584,80 @@ mod tests {
         );
     }
 
+    /// Regression: a `sprmPStyle` (0x640A) carried in the grpprl must override
+    /// the PAPX `istd` when resolving the style sheet. A paragraph whose PAPX
+    /// header says `Normal` (istd 0) but whose grpprl re-styles it to
+    /// `Heading 3` must resolve to level 3 — not `None`, and not whatever the
+    /// PAPX `istd` alone would have resolved to (which here is nothing).
+    #[test]
+    fn build_paragraphs_prefers_sprm_style_over_papx_istd() {
+        let styles = vec![
+            StyleDef::default(), // istd 0: Normal
+            StyleDef::default(), // istd 1
+            StyleDef::default(), // istd 2
+            StyleDef {
+                sti: 3,
+                name: "Heading 3".into(),
+            }, // istd 3: built-in Heading 3
+        ];
+        let raw = "Subsection\r";
+        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
+        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
+        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
+        // PAPX `istd` = 0 (Normal), but the grpprl carries `sprmPStyle` (0x640A,
+        // spra-3 => 4-byte operand) re-pointing at istd 3. The low two operand
+        // bytes are the target istd.
+        let grpprl = vec![0x0A, 0x64, 0x03, 0x00, 0x00, 0x00];
+        let fkp = [FkpParagraph {
+            fc_start: 0x800,
+            fc_end: 0x800 + raw.chars().count() as u32 * 2,
+            grpprl,
+            istd: 0,
+        }];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(
+            paras[0].props.heading_level,
+            Some(3),
+            "`sprmPStyle` override must win over the PAPX `istd`"
+        );
+    }
+
+    /// Regression: a user-defined heading style (sti 0x0FFE, name carries the
+    /// level) must resolve via its name, case-insensitively, through the full
+    /// `build_paragraphs` pipeline. Here the style name is lowercase
+    /// `"heading 3"` to prove the lookup is not case-sensitive.
+    #[test]
+    fn build_paragraphs_resolves_user_heading_name_case_insensitive() {
+        let styles = vec![
+            StyleDef::default(), // istd 0: Normal
+            StyleDef::default(), // istd 1
+            StyleDef {
+                sti: 0x0FFE,
+                name: "heading 3".into(),
+            }, // istd 2: user-defined, name carries level
+        ];
+        let raw = "Subsection\r";
+        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
+        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
+        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
+        let fkp = [FkpParagraph {
+            fc_start: 0x800,
+            fc_end: 0x800 + raw.chars().count() as u32 * 2,
+            grpprl: Vec::new(),
+            istd: 2,
+        }];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(
+            paras[0].props.heading_level,
+            Some(3),
+            "user-defined `heading N` name must resolve to its level"
+        );
+    }
+
     /// Regression: the `cw == 0` Word8 re-read branch must not drop the trailing
     /// byte of the grpprl. Per [MS-DOC] §2.9.175 (PapxInFkp), the
     /// re-read form is `[cb':1][GrpPrlAndIstd: 2*cb']`, so the grpprl is
