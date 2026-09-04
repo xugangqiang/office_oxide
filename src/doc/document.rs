@@ -582,6 +582,143 @@ mod tests {
         file
     }
 
+    /// Like `build_synthetic_styled_doc`, but paragraph 1 carries
+    /// `sprmPOutlineLvl` (0x6412) in its PAPX grpprl (level 5) instead of
+    /// relying on a style. Its PAPX `istd` is 0 (Normal), so the Heading level
+    /// comes solely from the outline SPRM — exercising the SPRM path end to end
+    /// (CFB → FKP → `build_paragraphs` → `doc_to_ir`).
+    fn build_synthetic_outline_doc() -> Vec<u8> {
+        const SECTOR: usize = 512;
+        const WORD_DOC_SECTORS: usize = 4; // 2048 bytes
+        const TABLE_SECTORS: usize = 2; // 1024 bytes
+        const TOTAL_SECTORS: usize = 1 + 1 + WORD_DOC_SECTORS + TABLE_SECTORS;
+
+        let mut file = vec![0u8; SECTOR + TOTAL_SECTORS * SECTOR];
+
+        // ── Header ──
+        file[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
+        file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
+        file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+        file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+        file[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes()); // FAT count = 1
+        file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // first dir = 0
+        file[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes()); // mini cutoff
+        file[0x3C..0x40].copy_from_slice(&CFB_EOC.to_le_bytes()); // no mini-FAT
+        file[0x40..0x44].copy_from_slice(&0u32.to_le_bytes());
+        file[0x44..0x48].copy_from_slice(&CFB_EOC.to_le_bytes()); // no DIFAT chain
+        file[0x48..0x4C].copy_from_slice(&0u32.to_le_bytes());
+        file[0x4C..0x50].copy_from_slice(&1u32.to_le_bytes()); // DIFAT[0] = FAT sector 1
+        for i in 1..109 {
+            let off = 0x4C + i * 4;
+            file[off..off + 4].copy_from_slice(&CFB_FREE.to_le_bytes());
+        }
+
+        // ── Directory (sector 0): Root Entry -> {WordDocument, 1Table} ──
+        let dir = SECTOR;
+        write_dir_entry(&mut file[dir..dir + 128], "Root Entry", 5, 1, CFB_EOC, 0);
+        write_dir_entry(
+            &mut file[dir + 128..dir + 256],
+            "WordDocument",
+            2,
+            CFB_FREE,
+            2,
+            (WORD_DOC_SECTORS * SECTOR) as u32,
+        );
+        write_dir_entry(
+            &mut file[dir + 256..dir + 384],
+            "1Table",
+            2,
+            CFB_FREE,
+            6,
+            (TABLE_SECTORS * SECTOR) as u32,
+        );
+
+        // ── FAT (sector 1) ──
+        let fat = SECTOR + SECTOR; // byte offset 1024
+        let mut fat_entry = |idx: usize, val: u32| {
+            let off = fat + idx * 4;
+            file[off..off + 4].copy_from_slice(&val.to_le_bytes());
+        };
+        fat_entry(0, CFB_EOC); // directory, single sector
+        fat_entry(1, CFB_FATSECT); // this sector is a FAT sector
+        fat_entry(2, 3); // WordDocument chain: 2 -> 3 -> 4 -> 5 -> EOC
+        fat_entry(3, 4);
+        fat_entry(4, 5);
+        fat_entry(5, CFB_EOC);
+        fat_entry(6, 7); // 1Table chain: 6 -> 7 -> EOC
+        fat_entry(7, CFB_EOC);
+        for i in 8..128 {
+            fat_entry(i, CFB_FREE);
+        }
+
+        // ── WordDocument stream (sectors 2..5) ──
+        let wd_off = SECTOR + 2 * SECTOR; // byte offset 1536
+        let mut wd = vec![0u8; WORD_DOC_SECTORS * SECTOR];
+
+        // FIB.
+        wd[0..2].copy_from_slice(&0xA5ECu16.to_le_bytes()); // wIdent (Word 97+)
+        wd[2..4].copy_from_slice(&0x00C1u16.to_le_bytes()); // nFib
+        wd[0x0A..0x0C].copy_from_slice(&(1u16 << 9).to_le_bytes()); // flags: use 1Table
+
+        let raw = "Introduction.\rSubsection Three\r";
+        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let ccp = (text_bytes.len() / 2) as u32; // main-text character count
+        wd[0x4C..0x50].copy_from_slice(&ccp.to_le_bytes()); // ccpText
+
+        let clx = build_clx(ccp);
+        let stsh = build_stsh_heading3();
+        wd[0xA2..0xA6].copy_from_slice(&768u32.to_le_bytes()); // fcStshf = 0x300
+        wd[0xA6..0xAA].copy_from_slice(&(stsh.len() as u32).to_le_bytes()); // lcbStshf
+        wd[0x102..0x106].copy_from_slice(&256u32.to_le_bytes()); // fcPlcfBtePapx
+        wd[0x106..0x10A].copy_from_slice(&12u32.to_le_bytes()); // lcbPlcfBtePapx
+        wd[0x1A2..0x1A6].copy_from_slice(&0u32.to_le_bytes()); // fcClx
+        wd[0x1A6..0x1AA].copy_from_slice(&(clx.len() as u32).to_le_bytes()); // lcbClx
+
+        // Document text at fc 0x300 (Unicode).
+        wd[0x300..0x300 + text_bytes.len()].copy_from_slice(&text_bytes);
+
+        // PAPX FKP page at page number 2 (byte offset 0x400). Two paragraphs:
+        // a Normal body paragraph and an outline-SPRM Heading-5 paragraph.
+        let para0_end_fc = 0x300 + ("Introduction.\r".encode_utf16().count() * 2) as u32;
+        let para1_end_fc = 0x300 + (raw.encode_utf16().count() * 2) as u32;
+        wd[0x400..0x404].copy_from_slice(&0x300u32.to_le_bytes()); // rgfc[0]
+        wd[0x404..0x408].copy_from_slice(&para0_end_fc.to_le_bytes()); // rgfc[1]
+        wd[0x408..0x40C].copy_from_slice(&para1_end_fc.to_le_bytes()); // rgfc[2]
+        // rgbx: byte 0 of each BX is the word offset of that paragraph's PAPX.
+        wd[0x40C] = 19; // para0 PAPX at byte 38 (word 19)
+        wd[0x419] = 21; // para1 PAPX at byte 42 (word 21)
+        // para0 PAPX: cw=2, istd=0 (Normal), empty grpprl.
+        wd[0x426] = 0x02; // cw
+        // 0x427..0x429 = istd 0x0000, 0x429 = grpprl (0x00)
+        // para1 PAPX: cw=5, istd=0 (Normal) — but the grpprl carries
+        // `sprmPOutlineLvl` (0x6412, spra-3 => 4-byte operand) with outline
+        // level 5. The PAPX is 1 (cw) + 2 (istd) + 7 (grpprl) = 10 bytes = cb.
+        wd[0x42A] = 0x05; // cw
+        wd[0x42B..0x42D].copy_from_slice(&0x0000u16.to_le_bytes()); // istd = 0 (Normal)
+        // grpprl: 0x6412 (LE) + 4-byte operand (low byte = 5) + 1 pad byte.
+        wd[0x42D..0x434].copy_from_slice(&[0x12, 0x64, 0x05, 0x00, 0x00, 0x00, 0x00]);
+        wd[0x5FF] = 2; // crun = 2
+
+        file[wd_off..wd_off + wd.len()].copy_from_slice(&wd);
+
+        // ── 1Table stream (sectors 6..7) ──
+        let tbl_off = SECTOR + 6 * SECTOR; // byte offset 3584
+        let mut tbl = vec![0u8; TABLE_SECTORS * SECTOR];
+        tbl[0..clx.len()].copy_from_slice(&clx); // CLX at offset 0
+        // PlcfBtePapx at 0x100: n=1 -> [FC0=0][FC1=ccp][BTE=pn 2].
+        tbl[0x100..0x104].copy_from_slice(&0u32.to_le_bytes());
+        tbl[0x104..0x108].copy_from_slice(&ccp.to_le_bytes());
+        tbl[0x108..0x10C].copy_from_slice(&2u32.to_le_bytes());
+        // STSH at 0x300.
+        tbl[0x300..0x300 + stsh.len()].copy_from_slice(&stsh);
+
+        file[tbl_off..tbl_off + tbl.len()].copy_from_slice(&tbl);
+
+        file
+    }
+
     /// Write a 128-byte CFB directory entry.
     fn write_dir_entry(
         buf: &mut [u8],
@@ -684,6 +821,41 @@ mod tests {
             ir.metadata.title.as_deref(),
             Some("Subsection Three"),
             "the styled heading becomes the document title"
+        );
+    }
+
+    #[test]
+    fn synthetic_doc_outline_sprm_heading() {
+        use crate::ir::Element;
+
+        let doc_bytes = build_synthetic_outline_doc();
+        // Full DOC pipeline: CFB → FIB → piece table → PAPX FKP → IR. The
+        // second paragraph's PAPX carries `sprmPOutlineLvl` (0x6412, level 5)
+        // in its grpprl with `istd` 0 (Normal), so the Heading level comes
+        // solely from the SPRM — the style-sheet path would resolve istd 0
+        // (Normal) to no heading at all, and the line heuristic tops out at
+        // level 2. Level 5 therefore proves the `sprmPOutlineLvl` path reached
+        // the IR end to end.
+        let doc = DocDocument::from_reader(std::io::Cursor::new(doc_bytes))
+            .expect("synthetic .doc must parse");
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+
+        let elements = &ir.sections[0].elements;
+        assert_eq!(elements.len(), 2, "expected intro paragraph + SPRM heading");
+        assert!(
+            matches!(elements[0], Element::Paragraph(_)),
+            "first element must be ordinary body prose"
+        );
+        match &elements[1] {
+            Element::Heading(h) => {
+                assert_eq!(h.level, 5, "outline SPRM must set the real level 5");
+            },
+            other => panic!("second element must be a Heading, got {:?}", other),
+        }
+        assert_eq!(
+            ir.metadata.title.as_deref(),
+            Some("Subsection Three"),
+            "the SPRM heading becomes the document title"
         );
     }
 }

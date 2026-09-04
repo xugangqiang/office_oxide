@@ -659,6 +659,75 @@ mod tests {
         );
     }
 
+    /// Regression: `sprmPOutlineLvl` (0x6412) carried in the grpprl must set the
+    /// heading level directly, with no style sheet involved. The opcode is
+    /// 0x6412 (LE) + a 4-byte operand whose low byte is the outline level; here
+    /// `5` must surface as Heading 5. This is the headline "outline SPRM" path
+    /// and was previously only covered at the `extract_pap_props` layer — this
+    /// test proves it flows through `FKP → build_paragraphs → props.heading_level`.
+    #[test]
+    fn build_paragraphs_resolves_heading_from_sprm_outline_lvl() {
+        let styles = vec![StyleDef::default()]; // istd 0: Normal
+        let raw = "Section Five\r";
+        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
+        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
+        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
+        // grpprl = 0x6412 (LE) + 4-byte operand, low byte = 5.
+        let grpprl = vec![0x12, 0x64, 0x05, 0x00, 0x00, 0x00];
+        let fkp = [FkpParagraph {
+            fc_start: 0x800,
+            fc_end: 0x800 + raw.chars().count() as u32 * 2,
+            grpprl,
+            istd: 0, // PAPX says Normal; the SPRM overrides it to Heading 5
+        }];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(
+            paras[0].props.heading_level,
+            Some(5),
+            "`sprmPOutlineLvl` must set the heading level directly"
+        );
+    }
+
+    /// Regression: when both a heading style and `sprmPOutlineLvl` are present,
+    /// the SPRM is authoritative and wins. Here the style (istd 3, built-in
+    /// Heading 3) would resolve to level 3, but the grpprl's `sprmPOutlineLvl`
+    /// level 5 must take precedence — proving the documented precedence
+    /// (`props.heading_level` is only filled from the style when the SPRM left
+    /// it `None`).
+    #[test]
+    fn build_paragraphs_sprm_outline_lvl_overrides_style() {
+        let styles = vec![
+            StyleDef::default(), // istd 0: Normal
+            StyleDef::default(), // istd 1
+            StyleDef::default(), // istd 2
+            StyleDef {
+                sti: 3,
+                name: "Heading 3".into(),
+            }, // istd 3: built-in Heading 3
+        ];
+        let raw = "Section Five\r";
+        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
+        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
+        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
+        let grpprl = vec![0x12, 0x64, 0x05, 0x00, 0x00, 0x00];
+        let fkp = [FkpParagraph {
+            fc_start: 0x800,
+            fc_end: 0x800 + raw.chars().count() as u32 * 2,
+            grpprl,
+            istd: 3, // would resolve to Heading 3 on its own
+        }];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(
+            paras[0].props.heading_level,
+            Some(5),
+            "`sprmPOutlineLvl` must override the style-derived level"
+        );
+    }
+
     /// A 4-style STSH (indices 0..3): `Normal`, two empty slots, and a built-in
     /// `Heading 3` (sti 3). Mirrors the layout `parse_stsh` expects: an 18-byte
     /// Stshif (cstd = 4), a style-name STTB, then 4 LPStd entries.
