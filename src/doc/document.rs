@@ -372,8 +372,9 @@ mod tests {
     /// an out-of-contract level.
     #[test]
     fn ir_deep_outline_level_clamps_to_ir_max_depth() {
-        use crate::doc::styles::{MAX_HEADING_DEPTH, MAX_OUTLINE_LEVEL};
+        use crate::doc::MAX_OUTLINE_LEVEL;
         use crate::ir::Element;
+        use crate::ir::MAX_HEADING_DEPTH;
         let doc = make_doc_with_paragraphs(vec![pap(
             "Deep section",
             crate::doc::sprm::PapProps {

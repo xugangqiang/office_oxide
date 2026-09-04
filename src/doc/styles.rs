@@ -10,18 +10,7 @@
 //! yields an empty `Vec`, so callers degrade to "no style" (and the heuristic)
 //! rather than panicking (AGENTS.md rule 6).
 
-use super::fib::Fib;
-
-/// The deepest outline level MS-DOC stores: `Heading 1`–`Heading 9`
-/// (`sprmPOutlineLvl` operand, `StdfBase.sti`, and a `Heading N` style name all
-/// use this range). Shared so every site that validates or derives a level reads
-/// the same bound — see [`MAX_HEADING_DEPTH`] for the IR-side clamp.
-pub const MAX_OUTLINE_LEVEL: u8 = 9;
-/// The deepest heading level the IR can express. `Heading::level` is a 1-6
-/// markdown-style depth, so MS-DOC outline levels above this clamp here at the
-/// IR boundary (`convert_doc`), matching the DOCX path's
-/// `(outline_level + 1).min(6)`.
-pub const MAX_HEADING_DEPTH: u8 = 6;
+use super::{MAX_OUTLINE_LEVEL, fib::Fib};
 
 /// One style definition, indexed by `istd`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

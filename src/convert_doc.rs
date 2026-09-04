@@ -1,6 +1,6 @@
-use crate::doc::styles::MAX_HEADING_DEPTH;
 use crate::doc::{DocDocument, DocParagraph, TapCellInfo, TapInfo};
 use crate::format::DocumentFormat;
+use crate::ir::MAX_HEADING_DEPTH;
 use crate::ir::*;
 
 /// Convert a parsed legacy `.doc` into the intermediate representation.

@@ -298,18 +298,29 @@ fn piece_byte_base(p: &Piece) -> (u32, u32) {
     }
 }
 
-/// Resolve a paragraph's heading level (1– [`MAX_OUTLINE_LEVEL`]), or `None`
+/// Resolve a paragraph's heading level (1–[`MAX_OUTLINE_LEVEL`]), or `None`
 /// when it is body text.
 ///
-/// The precedence is a single documented rule: an outline level carried directly
-/// in the grpprl by `sprmPOutlineLvl` (0x6412) is authoritative, because direct
-/// formatting overrides the style in Word. Only when that SPRM is absent does
-/// the level come from the paragraph's style — `istd`, already resolved by the
-/// caller from the PAPX header and any `sprmPStyle` (0x640A) override.
+/// The precedence is one documented rule. Direct formatting overrides the style
+/// in Word, so `sprmPOutlineLvl` (0x6412) settles the question whenever the
+/// grpprl carries a valid one:
+///
+/// - present with a level of 1–[`MAX_OUTLINE_LEVEL`] → that level, and the style
+///   is never consulted;
+/// - present with level `0` → an explicit body-text marker: `None`, and again
+///   the style is never consulted (a paragraph styled `Heading 3` but demoted to
+///   body text stays body text);
+/// - absent, or carrying an operand that is not a valid outline level → fall
+///   back to the paragraph's style, `istd`, which the caller has already
+///   resolved from the PAPX header and any `sprmPStyle` (0x640A) override.
 fn resolve_heading_level(props: &PapProps, istd: u16, styles: &[StyleDef]) -> Option<u8> {
-    props
-        .heading_level
-        .or_else(|| heading_level_for_istd(styles, istd))
+    if props.outline_lvl_explicit {
+        // Settled by direct formatting: either a real level or an explicit
+        // body-text marker (`None`).
+        props.heading_level
+    } else {
+        heading_level_for_istd(styles, istd)
+    }
 }
 
 /// Build the main-text paragraph list for `doc_to_ir`.
@@ -373,10 +384,11 @@ pub fn build_paragraphs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doc::MAX_OUTLINE_LEVEL;
     use crate::doc::fib::Fib;
     use crate::doc::piece_table::Piece;
     use crate::doc::sprm::extract_pap_props;
-    use crate::doc::styles::{MAX_OUTLINE_LEVEL, StyleDef, parse_style_sheet};
+    use crate::doc::styles::{StyleDef, parse_style_sheet};
 
     fn unicode_piece(fc: u32, cp_end: u32) -> Piece {
         Piece {
@@ -743,6 +755,116 @@ mod tests {
     /// where `STD` = `StdfBase` (10 bytes, `sti` in its low 12 bits) +
     /// `xstzName` (`cch` + code units + 2-byte null) — MS-DOC §2.9.135,
     /// §2.9.258, §2.9.354.
+    /// With a style sheet present but no heading signal on the paragraph, the
+    /// level must stay `None` so the `.doc` walk falls back to the line-based
+    /// heuristic. The other tests in this file mostly pass `&[]` for `styles`;
+    /// this one pins the behaviour with a *populated* style sheet, which is the
+    /// case a real document with a style sheet hits for its body text.
+    #[test]
+    fn build_paragraphs_leaves_body_text_unheaded_with_styles_present() {
+        let styles = vec![
+            StyleDef::default(), // istd 0: Normal
+            StyleDef {
+                sti: 3,
+                name: "Heading 3".into(),
+            }, // istd 1: a heading style exists in the document
+        ];
+        let raw = "Ordinary body prose.\r";
+        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
+        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
+        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
+        let fkp = [FkpParagraph {
+            fc_start: 0x800,
+            fc_end: 0x800 + raw.chars().count() as u32 * 2,
+            grpprl: Vec::new(),
+            istd: 0, // Normal
+        }];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(
+            paras[0].props.heading_level, None,
+            "body text stays unheaded even when the style sheet contains heading styles, \
+             so the caller falls back to the heuristic"
+        );
+    }
+
+    /// The `sprmPStyle` override must work in **both** directions. The existing
+    /// test covers restyling a `Normal` paragraph up to `Heading 3`; this covers
+    /// restyling a `Heading 3` paragraph down to `Normal`, which must *remove*
+    /// the heading rather than leaving the PAPX `istd`'s level in place.
+    #[test]
+    fn build_paragraphs_sprm_style_override_can_remove_a_heading() {
+        let styles = vec![
+            StyleDef::default(), // istd 0: Normal
+            StyleDef::default(), // istd 1
+            StyleDef::default(), // istd 2
+            StyleDef {
+                sti: 3,
+                name: "Heading 3".into(),
+            }, // istd 3: built-in Heading 3
+        ];
+        let raw = "Restyled to body text\r";
+        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
+        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
+        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
+        // PAPX `istd` = 3 (Heading 3) but `sprmPStyle` (0x640A) restyles it to
+        // istd 0 (Normal), so the heading must go away.
+        let grpprl = vec![0x0A, 0x64, 0x00, 0x00, 0x00, 0x00];
+        let fkp = [FkpParagraph {
+            fc_start: 0x800,
+            fc_end: 0x800 + raw.chars().count() as u32 * 2,
+            grpprl,
+            istd: 3,
+        }];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(
+            paras[0].props.heading_level, None,
+            "`sprmPStyle` restyling a heading down to Normal must drop the heading"
+        );
+    }
+
+    /// An explicit `sprmPOutlineLvl` of 0 marks the paragraph as **body text**.
+    /// Direct formatting overrides the style in Word, so such a paragraph must
+    /// not fall back to its style: a paragraph whose style is `Heading 3` but
+    /// which is explicitly marked body text is body text.
+    ///
+    /// This pins the difference between "the SPRM is absent" (consult the
+    /// style) and "the SPRM is present with level 0" (settle it as body text).
+    #[test]
+    fn build_paragraphs_sprm_outline_lvl_zero_suppresses_styled_heading() {
+        let styles = vec![
+            StyleDef::default(), // istd 0: Normal
+            StyleDef::default(), // istd 1
+            StyleDef::default(), // istd 2
+            StyleDef {
+                sti: 3,
+                name: "Heading 3".into(),
+            }, // istd 3: built-in Heading 3
+        ];
+        let raw = "Not a heading\r";
+        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
+        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
+        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
+        // 0x6412 (LE) + 4-byte operand whose low byte is 0 (explicit body text).
+        let grpprl = vec![0x12, 0x64, 0x00, 0x00, 0x00, 0x00];
+        let fkp = [FkpParagraph {
+            fc_start: 0x800,
+            fc_end: 0x800 + raw.chars().count() as u32 * 2,
+            grpprl,
+            istd: 3, // the style alone would resolve to Heading 3
+        }];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(
+            paras[0].props.heading_level, None,
+            "an explicit outline level 0 must suppress the style-derived heading"
+        );
+    }
+
     /// MS-DOC outline levels run to `MAX_OUTLINE_LEVEL` and `sprmPOutlineLvl`
     /// accepts that whole range; the clamp to the IR's 1..=MAX_HEADING_DEPTH
     /// depth happens later, at `emit_prose`. This pins the boundary: the SPRM
