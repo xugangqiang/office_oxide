@@ -728,35 +728,40 @@ mod tests {
         );
     }
 
-    /// A 4-style STSH (indices 0..3): `Normal`, two empty slots, and a built-in
-    /// `Heading 3` (sti 3). Mirrors the layout `parse_stsh` expects: an 18-byte
-    /// Stshif (cstd = 4), a style-name STTB, then 4 LPStd entries.
-    fn stsh_with_heading_3() -> Vec<u8> {
-        let mut d = Vec::new();
-        d.extend_from_slice(&18u16.to_le_bytes()); // cbStshi
-        d.extend_from_slice(&4u16.to_le_bytes()); // cstd = 4
-        d.extend_from_slice(&10u16.to_le_bytes()); // cbSTDBaseInFile
-        d.extend_from_slice(&[0u8; 14]); // remainder of the 18-byte Stshif
-        // Style-name STTB (f2 = 1, cData = 4, cbData = 0).
-        d.push(1);
-        d.extend_from_slice(&4u16.to_le_bytes());
-        d.extend_from_slice(&0u16.to_le_bytes());
-        for name in ["Normal", "", "", "Heading 3"] {
-            if name.is_empty() {
-                d.extend_from_slice(&0u16.to_le_bytes());
-            } else {
-                d.extend_from_slice(&(name.len() as u16).to_le_bytes());
-                for c in name.encode_utf16() {
-                    d.extend_from_slice(&c.to_le_bytes());
-                }
-            }
+    /// Build one `LPStd` for a synthetic style sheet: `cbStd(u16)` + `STD`,
+    /// where `STD` = `StdfBase` (10 bytes, `sti` in its low 12 bits) +
+    /// `xstzName` (`cch` + code units + 2-byte null) — MS-DOC §2.9.135,
+    /// §2.9.258, §2.9.354.
+    fn lpstd(sti: u16, name: &str) -> Vec<u8> {
+        let mut std = vec![0u8; 10]; // StdfBase
+        std[0..2].copy_from_slice(&sti.to_le_bytes());
+        let units: Vec<u16> = name.encode_utf16().collect();
+        std.extend_from_slice(&(units.len() as u16).to_le_bytes()); // cch
+        for u in &units {
+            std.extend_from_slice(&u.to_le_bytes());
         }
-        d.extend_from_slice(&0u16.to_le_bytes()); // trailing null string
-        // 4 LPStd entries: cbStd = 10 + StdfBase (sti in low 2 bytes).
-        for &sti in &[0u16, 0u16, 0u16, 3u16] {
-            d.extend_from_slice(&10u16.to_le_bytes());
-            d.extend_from_slice(&sti.to_le_bytes());
-            d.extend_from_slice(&[0u8; 8]);
+        std.extend_from_slice(&0u16.to_le_bytes()); // chTerm
+        let mut out = (std.len() as u16).to_le_bytes().to_vec(); // cbStd
+        out.extend_from_slice(&std);
+        out
+    }
+
+    /// A spec-conformant 15-style STSH (§2.9.271): `cbStshi`(18) then `Stshif`(18),
+    /// followed directly by `rglpstd`, using the fixed-index table — istd 0 is
+    /// Normal (sti 0), istd 1–9 are Heading 1–9 (sti 1–9), and istd 10–14 are
+    /// empty. So `istd 3` is `Heading 3`. Built from the spec, not from our
+    /// parser.
+    fn stsh_with_heading_3() -> Vec<u8> {
+        let mut d = 18u16.to_le_bytes().to_vec(); // cbStshi
+        d.extend_from_slice(&15u16.to_le_bytes()); // cstd
+        d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile
+        d.extend_from_slice(&[0u8; 14]); // remainder of the 18-byte Stshif
+        d.extend_from_slice(&lpstd(0, "Normal"));
+        for lvl in 1..=9u16 {
+            d.extend_from_slice(&lpstd(lvl, &format!("Heading {lvl}")));
+        }
+        for _ in 0..5 {
+            d.extend_from_slice(&[0u8; 2]); // empty LPStd (cbStd = 0)
         }
         d
     }
@@ -798,7 +803,7 @@ mod tests {
         table_stream[start..start + stsh.len()].copy_from_slice(&stsh);
         let fib = fib_with_stsh(start as u32, stsh.len() as u32);
         let styles = parse_style_sheet(&table_stream, &fib);
-        assert_eq!(styles.len(), 4);
+        assert_eq!(styles.len(), 15, "the 15 fixed-index LPStd entries");
         assert_eq!(styles[3].sti, 3);
         assert_eq!(styles[3].name, "Heading 3");
 

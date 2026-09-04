@@ -535,7 +535,7 @@ mod tests {
 
         let clx = build_clx(ccp);
         let stsh = build_stsh_heading3();
-        wd[0xA2..0xA6].copy_from_slice(&768u32.to_le_bytes()); // fcStshf = 0x300
+        wd[0xA2..0xA6].copy_from_slice(&288u32.to_le_bytes()); // fcStshf = 0x120
         wd[0xA6..0xAA].copy_from_slice(&(stsh.len() as u32).to_le_bytes()); // lcbStshf
         wd[0x102..0x106].copy_from_slice(&256u32.to_le_bytes()); // fcPlcfBtePapx
         wd[0x106..0x10A].copy_from_slice(&12u32.to_le_bytes()); // lcbPlcfBtePapx
@@ -574,8 +574,8 @@ mod tests {
         tbl[0x100..0x104].copy_from_slice(&0u32.to_le_bytes());
         tbl[0x104..0x108].copy_from_slice(&ccp.to_le_bytes());
         tbl[0x108..0x10C].copy_from_slice(&2u32.to_le_bytes());
-        // STSH at 0x300.
-        tbl[0x300..0x300 + stsh.len()].copy_from_slice(&stsh);
+        // STSH at 0x120 (0x300 would overflow the 2-sector table stream).
+        tbl[0x120..0x120 + stsh.len()].copy_from_slice(&stsh);
 
         file[tbl_off..tbl_off + tbl.len()].copy_from_slice(&tbl);
 
@@ -669,7 +669,7 @@ mod tests {
 
         let clx = build_clx(ccp);
         let stsh = build_stsh_heading3();
-        wd[0xA2..0xA6].copy_from_slice(&768u32.to_le_bytes()); // fcStshf = 0x300
+        wd[0xA2..0xA6].copy_from_slice(&288u32.to_le_bytes()); // fcStshf = 0x120
         wd[0xA6..0xAA].copy_from_slice(&(stsh.len() as u32).to_le_bytes()); // lcbStshf
         wd[0x102..0x106].copy_from_slice(&256u32.to_le_bytes()); // fcPlcfBtePapx
         wd[0x106..0x10A].copy_from_slice(&12u32.to_le_bytes()); // lcbPlcfBtePapx
@@ -711,8 +711,8 @@ mod tests {
         tbl[0x100..0x104].copy_from_slice(&0u32.to_le_bytes());
         tbl[0x104..0x108].copy_from_slice(&ccp.to_le_bytes());
         tbl[0x108..0x10C].copy_from_slice(&2u32.to_le_bytes());
-        // STSH at 0x300.
-        tbl[0x300..0x300 + stsh.len()].copy_from_slice(&stsh);
+        // STSH at 0x120 (0x300 would overflow the 2-sector table stream).
+        tbl[0x120..0x120 + stsh.len()].copy_from_slice(&stsh);
 
         file[tbl_off..tbl_off + tbl.len()].copy_from_slice(&tbl);
 
@@ -760,33 +760,38 @@ mod tests {
         clx
     }
 
-    /// A 4-style STSH (Normal, two empty slots, built-in `Heading 3` at istd 3).
-    /// Layout mirrors `papx::tests::stsh_with_heading_3`, which is known to parse
-    /// and yield `styles[3].sti == 3` / `name == "Heading 3"`.
-    fn build_stsh_heading3() -> Vec<u8> {
-        let mut d = Vec::new();
-        d.extend_from_slice(&18u16.to_le_bytes()); // cbStshi
-        d.extend_from_slice(&4u16.to_le_bytes()); // cstd = 4
-        d.extend_from_slice(&10u16.to_le_bytes()); // cbSTDBaseInFile
-        d.extend_from_slice(&[0u8; 14]); // remainder of the 18-byte Stshif
-        d.push(1); // STTB f2 = 1 (2-byte counts)
-        d.extend_from_slice(&4u16.to_le_bytes()); // cData = 4
-        d.extend_from_slice(&0u16.to_le_bytes()); // cbData = 0
-        for name in ["Normal", "", "", "Heading 3"] {
-            if name.is_empty() {
-                d.extend_from_slice(&0u16.to_le_bytes());
-            } else {
-                d.extend_from_slice(&(name.len() as u16).to_le_bytes());
-                for c in name.encode_utf16() {
-                    d.extend_from_slice(&c.to_le_bytes());
-                }
-            }
+    /// Build one `LPStd` (`cbStd` + `STD` = `StdfBase` + `xstzName`), per
+    /// MS-DOC §2.9.135 / §2.9.258 / §2.9.354.
+    fn lpstd(sti: u16, name: &str) -> Vec<u8> {
+        let mut std = vec![0u8; 10]; // StdfBase
+        std[0..2].copy_from_slice(&sti.to_le_bytes());
+        let units: Vec<u16> = name.encode_utf16().collect();
+        std.extend_from_slice(&(units.len() as u16).to_le_bytes()); // cch
+        for u in &units {
+            std.extend_from_slice(&u.to_le_bytes());
         }
-        d.extend_from_slice(&0u16.to_le_bytes()); // trailing null cch
-        for &sti in &[0u16, 0u16, 0u16, 3u16] {
-            d.extend_from_slice(&10u16.to_le_bytes()); // cbStd
-            d.extend_from_slice(&sti.to_le_bytes()); // StdfBase.sti
-            d.extend_from_slice(&[0u8; 8]); // rest of StdfBase
+        std.extend_from_slice(&0u16.to_le_bytes()); // chTerm
+        let mut out = (std.len() as u16).to_le_bytes().to_vec(); // cbStd
+        out.extend_from_slice(&std);
+        out
+    }
+
+    /// A spec-conformant 15-style STSH (§2.9.271): `cbStshi`(18) then `Stshif`(18),
+    /// followed directly by `rglpstd`, using the fixed-index table — istd 0 is
+    /// Normal (sti 0), istd 1–9 are Heading 1–9 (sti 1–9), and istd 10–14 are
+    /// empty. So `istd 3` is `Heading 3`. Built from the spec, not from our
+    /// parser.
+    fn build_stsh_heading3() -> Vec<u8> {
+        let mut d = 18u16.to_le_bytes().to_vec(); // cbStshi
+        d.extend_from_slice(&15u16.to_le_bytes()); // cstd
+        d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile
+        d.extend_from_slice(&[0u8; 14]); // remainder of the 18-byte Stshif
+        d.extend_from_slice(&lpstd(0, "Normal"));
+        for lvl in 1..=9u16 {
+            d.extend_from_slice(&lpstd(lvl, &format!("Heading {lvl}")));
+        }
+        for _ in 0..5 {
+            d.extend_from_slice(&[0u8; 2]); // empty LPStd (cbStd = 0)
         }
         d
     }

@@ -61,8 +61,13 @@ pub fn heading_level_for_istd(styles: &[StyleDef], istd: u16) -> Option<u8> {
 fn heading_level_from_name(name: &str) -> Option<u8> {
     // Real Word style names are "Heading N" (capital H); match case-insensitively
     // so "heading 2" / "HEADING 2" also resolve.
+    //
+    // `xstzName` may carry aliases as "primary,alias,alias" (MS-DOC §2.9.258);
+    // a heading level is always carried by the primary name, so look at the
+    // segment before the first comma.
     let lowered: String = name.trim().to_ascii_lowercase();
-    let rest = lowered.strip_prefix("heading ")?;
+    let primary = lowered.split(',').next().unwrap_or("");
+    let rest = primary.trim().strip_prefix("heading ")?;
     let level: u8 = rest.trim().parse().ok()?;
     if (1..=9).contains(&level) {
         Some(level)
@@ -71,11 +76,15 @@ fn heading_level_from_name(name: &str) -> Option<u8> {
     }
 }
 
-/// `data` is the `stshf` slice (the STSH). Layout (MS-DOC §2.7.1):
-/// `cbStshi(u16)` + `Stshif(cbStshi)` + style-name `STTB` + `cstd` `LPStd`
-/// (each `cbStd(u16)` + `Stdf`).
+/// `data` is the `stshf` slice (the STSH). Layout (MS-DOC §2.9.271):
+/// `LPStshi` = `cbStshi(u16)` + `Stshif(cbStshi bytes)`, immediately followed by
+/// `rglpstd`, an array of `cstd` `LPStd` entries (`cbStd(u16)` + `STD`).
+///
+/// There is **no** style-name table between `Stshif` and `rglpstd`: `Stshif` is
+/// exactly 18 bytes and carries no names (§2.9.274). Each style's name lives
+/// inside its own `STD`, which is `stdf` + `xstzName` + `grLPUpxSw` (§2.9.258),
+/// and `stdf` occupies `cbSTDBaseInFile` bytes.
 fn parse_stsh(data: &[u8]) -> Vec<StyleDef> {
-    // `cbStshi` then `Stshif`.
     if data.len() < 2 {
         return Vec::new();
     }
@@ -84,18 +93,22 @@ fn parse_stsh(data: &[u8]) -> Vec<StyleDef> {
     if cb_stshi < 18 || pos + cb_stshi > data.len() {
         return Vec::new();
     }
-    // Stshif: `cstd` at offset 0 (u16).
+    // Stshif (§2.9.274): `cstd` at 0 (u16), `cbSTDBaseInFile` at 2 (u16).
     let cstd = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+    let cb_std_base = u16::from_le_bytes([data[pos + 2], data[pos + 3]]) as usize;
     pos += cb_stshi;
 
-    // Style-name STTB.
-    let (names, next) = match parse_sttb(data, pos) {
-        Some(v) => v,
-        None => return Vec::new(),
-    };
-    pos = next;
+    // `cbSTDBaseInFile` MUST be 0x000A (`StdfBase` alone) or 0x0012 (`StdfBase`
+    // + `StdfPost2000OrNone`) per §2.9.274. Anything else is malformed: slicing
+    // `xstzName` at a bogus offset would yield plausible-but-wrong names, and
+    // hence plausible-but-wrong heading levels, so reject and let the caller
+    // degrade to the line heuristic rather than guess (AGENTS.md rule: fail
+    // loudly, never fall back to a silent plausible-but-wrong result).
+    if cb_std_base != 0x000A && cb_std_base != 0x0012 {
+        return Vec::new();
+    }
 
-    // Style-definition array: `cstd` `LPStd` entries, each `cbStd(u16)` + `Stdf`.
+    // `rglpstd`: `cstd` `LPStd` entries (§2.9.135).
     let cap = cstd.min(4096);
     let mut styles = Vec::with_capacity(cap);
     for _ in 0..cap {
@@ -105,7 +118,7 @@ fn parse_stsh(data: &[u8]) -> Vec<StyleDef> {
         let cb_std = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
         if cb_std == 0 {
-            // Empty style (fixed-index slots MAY be empty).
+            // Empty style (fixed-index slots MAY be empty, §2.9.271).
             styles.push(StyleDef::default());
             continue;
         }
@@ -113,160 +126,252 @@ fn parse_stsh(data: &[u8]) -> Vec<StyleDef> {
             break;
         }
         let std = &data[pos..pos + cb_std];
-        pos += cb_std;
-        // `StdfBase.sti` is the low 12 bits of the first u16.
+        // `StdfBase.sti` is the low 12 bits of the first u16 (§2.9.260).
         let sti = if std.len() >= 2 {
             u16::from_le_bytes([std[0], std[1]]) & 0x0FFF
         } else {
             0
         };
-        styles.push(StyleDef {
-            sti,
-            name: String::new(),
-        });
-    }
-
-    // Names and definitions are both indexed by `istd`; attach by index.
-    for (i, s) in styles.iter_mut().enumerate() {
-        if let Some(n) = names.get(i) {
-            s.name = n.clone();
+        // The name follows `stdf`, which occupies `cbSTDBaseInFile` bytes.
+        let name = if std.len() > cb_std_base {
+            parse_xstz(&std[cb_std_base..]).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        styles.push(StyleDef { sti, name });
+        pos += cb_std;
+        // LPStd entries are stored on even-byte boundaries and `cbStd` does NOT
+        // include that padding byte (§2.9.135).
+        if !cb_std.is_multiple_of(2) {
+            pos += 1;
         }
     }
     styles
 }
 
-/// Parse an `STTB` (§2.4.1) starting at `pos`, returning the strings and the
-/// offset just past the table (including its trailing null entry).
-fn parse_sttb(data: &[u8], mut pos: usize) -> Option<(Vec<String>, usize)> {
-    if pos + 3 > data.len() {
+/// Parse an `Xstz` (§2.9.354) — a style name: an `Xst` (a `cch: u16` followed
+/// by `cch` UTF-16 code units) plus a 2-byte null terminator.
+///
+/// Per §2.9.258 the name may be `"primary,alias,alias"`; callers that want only
+/// the primary name split on `','` themselves (`heading_level_from_name` does).
+fn parse_xstz(data: &[u8]) -> Option<String> {
+    if data.len() < 2 {
         return None;
     }
-    let f2 = data[pos]; // 1 => 2-byte counts, 0 => 1-byte counts
-    pos += 1;
-    let c_data = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-    pos += 2;
-    let count_len = if f2 != 0 { 2 } else { 1 };
-    let (cb_data, mut pos) = if f2 != 0 {
-        (u16::from_le_bytes([data[pos], data[pos + 1]]) as usize, pos + 2)
-    } else {
-        (data[pos] as usize, pos + 1)
-    };
-
-    let cap = c_data.min(4096);
-    let mut names = Vec::with_capacity(cap);
-    for _ in 0..cap {
-        if pos + count_len > data.len() {
-            return None;
-        }
-        let cch = if f2 != 0 {
-            let v = u16::from_le_bytes([data[pos], data[pos + 1]]);
-            pos += 2;
-            v as usize
-        } else {
-            let v = data[pos];
-            pos += 1;
-            v as usize
-        };
-        let str_bytes = cch.saturating_mul(2);
-        if pos + str_bytes > data.len() {
-            return None;
-        }
-        let units: Vec<u16> = (0..cch)
-            .map(|i| u16::from_le_bytes([data[pos + 2 * i], data[pos + 2 * i + 1]]))
-            .collect();
-        pos += str_bytes;
-        if pos + cb_data > data.len() {
-            return None;
-        }
-        pos += cb_data; // skip per-entry extra data
-        names.push(String::from_utf16_lossy(&units));
+    let cch = u16::from_le_bytes([data[0], data[1]]) as usize;
+    let end = 2usize.saturating_add(cch.saturating_mul(2));
+    if end > data.len() {
+        return None;
     }
-
-    // Trailing null string entry (cch = 0).
-    if pos + count_len <= data.len() {
-        pos += count_len;
-    }
-    Some((names, pos))
+    let units: Vec<u16> = (0..cch)
+        .map(|i| u16::from_le_bytes([data[2 + 2 * i], data[3 + 2 * i]]))
+        .collect();
+    Some(String::from_utf16_lossy(&units))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a minimal but well-formed STSH: 3 styles — `Normal` (sti 0),
-    /// `Body Text` (sti 2), and a user-defined `Heading 2` (sti 0x0FFE).
+    /// Build one `LPStd` for a style sheet: `cbStd(u16)` + `STD`.
+    ///
+    /// `STD` = `stdf` (`cbSTDBaseInFile` bytes, here `StdfBase` alone) +
+    /// `xstzName`, per MS-DOC §2.9.258. `xstzName` is an `Xstz`: `cch(u16)` +
+    /// `cch` UTF-16 code units + a 2-byte null terminator (§2.9.354).
+    fn lpstd(sti: u16, name: &str) -> Vec<u8> {
+        const CB_STD_BASE: usize = 0x000A;
+        // `StdfBase` (10 bytes): `sti` is the low 12 bits of the first u16.
+        let mut std = vec![0u8; CB_STD_BASE];
+        std[0..2].copy_from_slice(&sti.to_le_bytes());
+        // `xstzName`.
+        let units: Vec<u16> = name.encode_utf16().collect();
+        std.extend_from_slice(&(units.len() as u16).to_le_bytes()); // cch
+        for u in &units {
+            std.extend_from_slice(&u.to_le_bytes());
+        }
+        std.extend_from_slice(&0u16.to_le_bytes()); // chTerm
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&(std.len() as u16).to_le_bytes()); // cbStd
+        out.extend_from_slice(&std);
+        out
+    }
+
+    /// An empty `LPStd` (`cbStd` = 0). Fixed-index slots 13–14 MUST be empty
+    /// (§2.9.271) and 0–12 MAY be.
+    fn empty_lpstd() -> Vec<u8> {
+        vec![0, 0]
+    }
+
+    /// Build a spec-conformant STSH (§2.9.271 / §2.9.274): `LPStshi`
+    /// (`cbStshi` = 18 + an 18-byte `Stshif`) followed directly by `rglpstd`.
+    ///
+    /// The 16 entries follow the fixed-index table: istd 0 = Normal (sti 0),
+    /// istd 1–9 = Heading 1–9 (sti 1–9), istd 10–12 = sti 65/105/107, istd
+    /// 13–14 empty, and istd 15 a user-defined style (sti 0x0FFE) whose name
+    /// carries its level. Deliberately built from the spec, not from our
+    /// parser, so it cannot merely re-encode our own bugs.
     fn synthetic_stsh() -> Vec<u8> {
         let mut d = Vec::new();
-        // cbStshi = 18
-        d.extend_from_slice(&18u16.to_le_bytes());
-        // Stshif: cstd = 3, cbSTDBaseInFile = 10, rest 0.
-        d.extend_from_slice(&3u16.to_le_bytes());
-        d.extend_from_slice(&10u16.to_le_bytes());
-        d.extend_from_slice(&[0u8; 14]); // remainder of the 18-byte Stshif
+        // ── LPStshi: cbStshi, then Stshif (18 bytes total, no names) ──
+        d.extend_from_slice(&18u16.to_le_bytes()); // cbStshi = 18
+        d.extend_from_slice(&16u16.to_le_bytes()); // cstd
+        d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile = 10
+        d.extend_from_slice(&[0u8; 2]); // fStdStylenamesWritten + fReserved
+        d.extend_from_slice(&108u16.to_le_bytes()); // stiMaxWhenSaved
+        d.extend_from_slice(&0x000Fu16.to_le_bytes()); // istdMaxFixedWhenSaved
+        d.extend_from_slice(&0u16.to_le_bytes()); // nVerBuiltInNamesWhenSaved
+        d.extend_from_slice(&[0u8; 6]); // ftcAsci, ftcFE, ftcOther
 
-        // Style-name STTB (f2 = 1, cData = 3, cbData = 0).
-        d.push(1); // f2
-        d.extend_from_slice(&3u16.to_le_bytes()); // cData
-        d.extend_from_slice(&0u16.to_le_bytes()); // cbData
-        // entry 0: "Normal"
-        let name0 = "Normal";
-        d.extend_from_slice(&(name0.len() as u16).to_le_bytes());
-        for c in name0.encode_utf16() {
-            d.extend_from_slice(&c.to_le_bytes());
+        // ── rglpstd ──
+        d.extend_from_slice(&lpstd(0, "Normal")); // istd 0
+        for lvl in 1..=9u16 {
+            d.extend_from_slice(&lpstd(lvl, &format!("Heading {lvl}"))); // 1–9
         }
-        // entry 1: "Heading 1"
-        let name1 = "Heading 1";
-        d.extend_from_slice(&(name1.len() as u16).to_le_bytes());
-        for c in name1.encode_utf16() {
-            d.extend_from_slice(&c.to_le_bytes());
-        }
-        // entry 2: "Heading 2"
-        let name2 = "Heading 2";
-        d.extend_from_slice(&(name2.len() as u16).to_le_bytes());
-        for c in name2.encode_utf16() {
-            d.extend_from_slice(&c.to_le_bytes());
-        }
-        // trailing null string (cch = 0, 2 bytes)
-        d.extend_from_slice(&0u16.to_le_bytes());
-
-        // `cstd` = 3 LPStd entries, each cbStd = 10 + StdfBase.
-        // entry 0: sti = 0 (Normal)
-        d.extend_from_slice(&10u16.to_le_bytes());
-        d.extend_from_slice(&[0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]);
-        // entry 1: sti = 1 (built-in Heading 1)
-        d.extend_from_slice(&10u16.to_le_bytes());
-        d.extend_from_slice(&[0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]);
-        // entry 2: sti = 0x0FFE (user-defined heading, name carries the level)
-        d.extend_from_slice(&10u16.to_le_bytes());
-        d.extend_from_slice(&[0xFE, 0x0F, 0, 0, 0, 0, 0, 0, 0, 0]);
-
+        d.extend_from_slice(&lpstd(65, "Fixed Ten")); // istd 10
+        d.extend_from_slice(&lpstd(105, "Fixed Eleven")); // istd 11
+        d.extend_from_slice(&lpstd(107, "Fixed Twelve")); // istd 12
+        d.extend_from_slice(&empty_lpstd()); // istd 13 — MUST be empty
+        d.extend_from_slice(&empty_lpstd()); // istd 14 — MUST be empty
+        d.extend_from_slice(&lpstd(0x0FFE, "heading 7")); // istd 15: user style
         d
     }
 
     #[test]
     fn parse_stsh_reads_sti_and_names() {
         let styles = parse_stsh(&synthetic_stsh());
-        assert_eq!(styles.len(), 3);
+        assert_eq!(styles.len(), 16, "all 16 LPStd entries must be decoded");
+        // istd 0: Normal.
         assert_eq!(styles[0].sti, 0);
         assert_eq!(styles[0].name, "Normal");
+        // istd 1..9: built-in Heading 1..9 — names come from each STD, not
+        // from any shared table.
         assert_eq!(styles[1].sti, 1);
         assert_eq!(styles[1].name, "Heading 1");
-        // User-defined heading: sti 0x0FFE, name "Heading 2".
-        assert_eq!(styles[2].sti, 0x0FFE);
-        assert_eq!(styles[2].name, "Heading 2");
+        assert_eq!(styles[3].sti, 3);
+        assert_eq!(styles[3].name, "Heading 3");
+        assert_eq!(styles[9].sti, 9);
+        assert_eq!(styles[9].name, "Heading 9");
+        // istd 13/14 are empty.
+        assert_eq!(styles[13], StyleDef::default());
+        assert_eq!(styles[14], StyleDef::default());
+        // istd 15: user-defined (sti 0x0FFE), name carries the level.
+        assert_eq!(styles[15].sti, 0x0FFE);
+        assert_eq!(styles[15].name, "heading 7");
+    }
+
+    /// Regression guard: an earlier revision decoded the style sheet as
+    /// `cbStshi + Stshif + a style-name STTB + rglpstd`. That is wrong —
+    /// `Stshif` is exactly 18 bytes and carries no names, and `rglpstd`
+    /// follows immediately (§2.9.271); names live in each `STD.xstzName`.
+    /// A style sheet laid out the old way must not be silently decoded into
+    /// plausible-but-wrong style names: it must yield nothing, so the caller
+    /// degrades to the line heuristic instead of inventing heading levels.
+    #[test]
+    fn parse_stsh_rejects_spurious_name_table_layout() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&18u16.to_le_bytes()); // cbStshi
+        d.extend_from_slice(&4u16.to_le_bytes()); // cstd
+        d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile
+        d.extend_from_slice(&[0u8; 14]); // rest of Stshif
+        // The spurious style-name "STTB" that the old revision expected.
+        d.push(1); // f2
+        d.extend_from_slice(&4u16.to_le_bytes()); // cData
+        d.extend_from_slice(&0u16.to_le_bytes()); // cbData
+        for name in ["Normal", "", "", "Heading 3"] {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            d.extend_from_slice(&(units.len() as u16).to_le_bytes());
+            for u in units {
+                d.extend_from_slice(&u.to_le_bytes());
+            }
+        }
+        d.extend_from_slice(&0u16.to_le_bytes()); // trailing null cch
+        for &sti in &[0u16, 0u16, 0u16, 3u16] {
+            d.extend_from_slice(&10u16.to_le_bytes()); // cbStd
+            d.extend_from_slice(&sti.to_le_bytes());
+            d.extend_from_slice(&[0u8; 8]);
+        }
+
+        let styles = parse_stsh(&d);
+        assert!(
+            styles.iter().all(|s| s.name.is_empty()),
+            "a spurious name table must not yield plausible style names; got {styles:?}"
+        );
+    }
+
+    /// The name must be read from `STD.xstzName`, i.e. at `cbSTDBaseInFile`
+    /// bytes into each `STD`. A fixture that shifts the name by even one byte
+    /// must not silently produce a plausible-but-wrong name.
+    #[test]
+    fn parse_stsh_rejects_unexpected_cb_std_base_in_file() {
+        let mut stsh = synthetic_stsh();
+        // `cbSTDBaseInFile` is the u16 at offset 4 (cbStshi + cstd). Spec allows
+        // only 0x000A / 0x0012; anything else is malformed.
+        stsh[4..6].copy_from_slice(&0x0020u16.to_le_bytes());
+        assert!(
+            parse_stsh(&stsh).is_empty(),
+            "a bogus cbSTDBaseInFile must be rejected, not guess a name offset"
+        );
+    }
+
+    /// `LPStd` entries sit on even-byte boundaries and `cbStd` excludes the
+    /// padding byte (§2.9.135), so an odd-sized `STD` must not desynchronise the
+    /// following entries.
+    #[test]
+    fn parse_stsh_skips_odd_sized_lpstd_padding() {
+        let mut stsh = synthetic_stsh();
+        // Rebuild rglpstd: one odd-sized entry, then a normal one.
+        let mut rglpstd = Vec::new();
+        let mut odd = lpstd(2, "Heading 2");
+        // Trim one byte off `STD` (and fix up cbStd) to make cbStd odd.
+        let cb = u16::from_le_bytes([odd[0], odd[1]]) as usize;
+        odd.truncate(cb + 1); // 2 (cbStd) + cb-1 bytes of STD
+        let new_cb = (cb - 1) as u16;
+        odd[0..2].copy_from_slice(&new_cb.to_le_bytes());
+        rglpstd.extend_from_slice(&odd);
+        rglpstd.push(0x00); // the padding byte `cbStd` does not count
+        rglpstd.extend_from_slice(&lpstd(3, "Heading 3"));
+        stsh.truncate(20); // keep cbStshi + Stshif
+        stsh.extend_from_slice(&rglpstd);
+
+        let styles = parse_stsh(&stsh);
+        assert_eq!(styles.len(), 2, "both entries must be read");
+        assert_eq!(styles[0].sti, 2, "odd-sized entry decodes normally");
+        assert_eq!(
+            styles[1].name, "Heading 3",
+            "the padding byte must not desynchronise the next entry"
+        );
     }
 
     #[test]
     fn heading_level_resolves_builtin_and_user() {
         let styles = parse_stsh(&synthetic_stsh());
-        // sti 1..9 resolve directly.
+        // Built-in: sti 1..9 resolve directly (istd 1..9).
         assert_eq!(heading_level_for_istd(&styles, 1), Some(1));
-        // sti 0x0FFE named "Heading 2" resolves via name.
-        assert_eq!(heading_level_for_istd(&styles, 2), Some(2));
+        assert_eq!(heading_level_for_istd(&styles, 3), Some(3));
+        assert_eq!(heading_level_for_istd(&styles, 9), Some(9));
+        // User-defined: sti 0x0FFE named "heading 7" resolves via name.
+        assert_eq!(heading_level_for_istd(&styles, 15), Some(7));
         // sti 0 (Normal) is not a heading.
         assert_eq!(heading_level_for_istd(&styles, 0), None);
+        // Empty fixed-index slots are not headings.
+        assert_eq!(heading_level_for_istd(&styles, 13), None);
         // out-of-range istd.
         assert_eq!(heading_level_for_istd(&styles, 99), None);
+    }
+
+    /// `xstzName` may carry aliases as "primary,alias" (§2.9.258); the level is
+    /// carried by the primary name, so a comma-suffixed name must still resolve.
+    #[test]
+    fn heading_level_uses_primary_name_before_aliases() {
+        let styles = vec![
+            StyleDef::default(),
+            StyleDef {
+                sti: 0x0FFE,
+                name: "Heading 4,Title 4".into(),
+            },
+        ];
+        assert_eq!(heading_level_for_istd(&styles, 1), Some(4));
     }
 
     #[test]
@@ -312,13 +417,13 @@ mod tests {
         table_stream[start..start + stsh.len()].copy_from_slice(&stsh);
         let fib = fib_with_stsh(start as u32, stsh.len() as u32);
         let styles = parse_style_sheet(&table_stream, &fib);
-        assert_eq!(styles.len(), 3);
+        assert_eq!(styles.len(), 16);
         assert_eq!(styles[0].sti, 0);
         assert_eq!(styles[0].name, "Normal");
-        assert_eq!(styles[1].sti, 1);
-        assert_eq!(styles[1].name, "Heading 1");
-        assert_eq!(styles[2].sti, 0x0FFE);
-        assert_eq!(styles[2].name, "Heading 2");
+        assert_eq!(styles[3].sti, 3);
+        assert_eq!(styles[3].name, "Heading 3");
+        assert_eq!(styles[15].sti, 0x0FFE);
+        assert_eq!(styles[15].name, "heading 7");
     }
 
     #[test]
