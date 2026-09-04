@@ -27,6 +27,8 @@
 
 use crate::ir::{TabAlignment, TabLeader, TabStop};
 
+use super::styles::MAX_OUTLINE_LEVEL;
+
 /// A single decoded SPRM: opcode plus its operand bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sprm {
@@ -215,27 +217,23 @@ pub struct PapProps {
     /// list/tab-stop PR; in the tables-only PR this field is always empty, but
     /// it is cloned through the IR so the `Paragraph.tabs` shape stays uniform.
     pub tabs: Vec<TabStop>,
-    /// Resolved heading level (1–9) when this paragraph is a heading, derived
-    /// either from `sprmPOutlineLvl` (0x6412) carried directly in the grpprl,
-    /// or from the paragraph's style (the PAPX `istd`, optionally overridden by
-    /// `sprmPStyle` 0x640A) looked up in the document style sheet — see
-    /// `crate::doc::styles`. `None` means "not a heading" (body text), and the
-    /// `.doc` walk falls back to the line-based heading heuristic in that case.
+    /// The style index this paragraph is restyled to by a direct `sprmPStyle`
+    /// (0x640A) in the grpprl, if any. It overrides the PAPX header's own
+    /// `istd` when resolving the style (see `crate::doc::styles`); `None` means
+    /// the PAPX header `istd` applies unchanged.
+    pub style_istd: Option<u16>,
+    /// Resolved heading level (1–9) when this paragraph is a heading.
+    ///
+    /// This is a **derived** value, not a raw SPRM property, and it is filled in
+    /// two stages: `extract_pap_props` sets it from `sprmPOutlineLvl` (0x6412)
+    /// when that SPRM is present; otherwise it stays `None` until
+    /// `build_paragraphs` falls back to the paragraph's style via
+    /// `resolve_heading_level`. So the value returned by `extract_pap_props`
+    /// alone is *not* necessarily final.
+    ///
+    /// `None` means "not a heading" (body text), and the `.doc` walk then falls
+    /// back to the line-based heading heuristic.
     pub heading_level: Option<u8>,
-}
-
-/// Scan a PAP `grpprl` for `sprmPStyle` (0x640A) and return the style index
-/// (`istd`) it overrides the PAPX header with, if present.
-///
-/// The PAPX header `istd` is the default style; a direct `sprmPStyle` SPRM
-/// takes precedence. Returns `None` when the grpprl carries no style SPRM.
-pub fn paragraph_style_istd(grpprl: &[u8]) -> Option<u16> {
-    for sprm in parse_grpprl(grpprl) {
-        if sprm.opcode == 0x640A && sprm.operand.len() >= 2 {
-            return Some(u16::from_le_bytes([sprm.operand[0], sprm.operand[1]]));
-        }
-    }
-    None
 }
 
 /// One table cell descriptor (TKBKTAP, 20 bytes) distilled from a row's
@@ -441,6 +439,15 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
                     props.ilvl = Some(b);
                 }
             },
+            // sprmPStyle (0x640A) — the 4-byte operand's low word is the style
+            // index (`istd`) this paragraph is restyled to. Read here rather
+            // than in a separate pass so the grpprl is walked only once; it
+            // overrides the PAPX header `istd` when the style is resolved.
+            0x640A => {
+                if sprm.operand.len() >= 2 {
+                    props.style_istd = Some(u16::from_le_bytes([sprm.operand[0], sprm.operand[1]]));
+                }
+            },
             // sprmPOutlineLvl (0x6412) — the 4-byte operand's low byte is the
             // outline level: `0` = body text, `1`–`9` = Heading 1–9 (MS-DOC
             // §2.9.138). This is the authoritative heading marker and wins over
@@ -452,7 +459,7 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
             // valid outline level and must be rejected, not masked to `8`.
             0x6412 => {
                 if let Some(&b) = sprm.operand.first() {
-                    if (1..=9).contains(&b) {
+                    if (1..=MAX_OUTLINE_LEVEL).contains(&b) {
                         props.heading_level = Some(b);
                     }
                 }
@@ -537,17 +544,19 @@ mod tests {
     }
 
     /// `sprmPStyle` (0x640A) overrides the PAPX `istd`; the 2-byte istd is the
-    /// low word of the (spra-3, 4-byte) operand.
+    /// low word of the (spra-3, 4-byte) operand. It surfaces on
+    /// `PapProps.style_istd` from the same grpprl walk that decodes the other
+    /// paragraph properties.
     #[test]
-    fn paragraph_style_istd_reads_override() {
+    fn pap_props_read_sprm_p_style_override() {
         // opcode 0x640A (LE) + 4-byte operand, low word = istd 5.
         let grpprl = vec![0x0A, 0x64, 0x05, 0x00, 0x00, 0x00];
-        assert_eq!(paragraph_style_istd(&grpprl), Some(5));
+        assert_eq!(extract_pap_props(&grpprl).style_istd, Some(5));
     }
 
     #[test]
-    fn paragraph_style_istd_absent_when_no_sprm() {
-        assert_eq!(paragraph_style_istd(&[0x16, 0x24, 0x01]), None);
+    fn pap_props_style_istd_absent_when_no_sprm() {
+        assert_eq!(extract_pap_props(&[0x16, 0x24, 0x01]).style_istd, None);
     }
 
     #[test]

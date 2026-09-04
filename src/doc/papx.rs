@@ -17,7 +17,7 @@
 //! The `grpprl` is decoded by [`super::sprm::extract_pap_props`].
 
 use super::piece_table::{Piece, decode_cp_range, sanitize_text};
-use super::sprm::{PapProps, paragraph_style_istd};
+use super::sprm::PapProps;
 use super::styles::{StyleDef, heading_level_for_istd};
 
 /// A paragraph descriptor recovered from a PAPX FKP page.
@@ -298,6 +298,20 @@ fn piece_byte_base(p: &Piece) -> (u32, u32) {
     }
 }
 
+/// Resolve a paragraph's heading level (1– [`MAX_OUTLINE_LEVEL`]), or `None`
+/// when it is body text.
+///
+/// The precedence is a single documented rule: an outline level carried directly
+/// in the grpprl by `sprmPOutlineLvl` (0x6412) is authoritative, because direct
+/// formatting overrides the style in Word. Only when that SPRM is absent does
+/// the level come from the paragraph's style — `istd`, already resolved by the
+/// caller from the PAPX header and any `sprmPStyle` (0x640A) override.
+fn resolve_heading_level(props: &PapProps, istd: u16, styles: &[StyleDef]) -> Option<u8> {
+    props
+        .heading_level
+        .or_else(|| heading_level_for_istd(styles, istd))
+}
+
 /// Build the main-text paragraph list for `doc_to_ir`.
 ///
 /// Walks the PAPX FKP paragraphs, keeps only those whose start CP falls in
@@ -341,15 +355,12 @@ pub fn build_paragraphs(
         }
         let terminator = chars[chars.len() - 1];
         let content: String = sanitize_text(&chars[..chars.len() - 1].iter().collect::<String>());
+        // `extract_pap_props` walks the grpprl once, decoding every PAP SPRM —
+        // including `sprmPStyle` (0x640A) into `style_istd` and
+        // `sprmPOutlineLvl` (0x6412) into `heading_level`.
         let mut props = super::sprm::extract_pap_props(&fp.grpprl);
-        // Resolve the heading level from the paragraph's style. A `sprmPStyle`
-        // (0x640A) in the grpprl overrides the PAPX `istd`; otherwise use the
-        // PAPX `istd`. A `sprmPOutlineLvl` (0x6412) already sets
-        // `heading_level` directly and takes precedence when present.
-        let istd = paragraph_style_istd(&fp.grpprl).unwrap_or(fp.istd);
-        if props.heading_level.is_none() {
-            props.heading_level = heading_level_for_istd(styles, istd);
-        }
+        let istd = props.style_istd.unwrap_or(fp.istd);
+        props.heading_level = resolve_heading_level(&props, istd, styles);
         out.push(DocParagraph {
             text: content,
             terminator,
@@ -365,7 +376,7 @@ mod tests {
     use crate::doc::fib::Fib;
     use crate::doc::piece_table::Piece;
     use crate::doc::sprm::extract_pap_props;
-    use crate::doc::styles::{StyleDef, parse_style_sheet};
+    use crate::doc::styles::{MAX_OUTLINE_LEVEL, StyleDef, parse_style_sheet};
 
     fn unicode_piece(fc: u32, cp_end: u32) -> Piece {
         Piece {
@@ -732,6 +743,36 @@ mod tests {
     /// where `STD` = `StdfBase` (10 bytes, `sti` in its low 12 bits) +
     /// `xstzName` (`cch` + code units + 2-byte null) — MS-DOC §2.9.135,
     /// §2.9.258, §2.9.354.
+    /// MS-DOC outline levels run to `MAX_OUTLINE_LEVEL` and `sprmPOutlineLvl`
+    /// accepts that whole range; the clamp to the IR's 1..=MAX_HEADING_DEPTH
+    /// depth happens later, at `emit_prose`. This pins the boundary: the SPRM
+    /// path must neither reject the deepest level nor pre-clamp it.
+    #[test]
+    fn build_paragraphs_sprm_outline_lvl_accepts_deepest_level() {
+        let styles = vec![StyleDef::default()]; // istd 0: Normal
+        let raw = "Deep section\r";
+        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
+        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
+        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
+        // 0x6412 (LE) + 4-byte operand whose low byte is the deepest level.
+        let grpprl = vec![0x12, 0x64, MAX_OUTLINE_LEVEL, 0x00, 0x00, 0x00];
+        let fkp = [FkpParagraph {
+            fc_start: 0x800,
+            fc_end: 0x800 + raw.chars().count() as u32 * 2,
+            grpprl,
+            istd: 0,
+        }];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(
+            paras[0].props.heading_level,
+            Some(MAX_OUTLINE_LEVEL),
+            "the outline SPRM accepts the full 1..=MAX_OUTLINE_LEVEL range; clamping to \
+             MAX_HEADING_DEPTH is the IR boundary's job, not this one"
+        );
+    }
+
     fn lpstd(sti: u16, name: &str) -> Vec<u8> {
         let mut std = vec![0u8; 10]; // StdfBase
         std[0..2].copy_from_slice(&sti.to_le_bytes());

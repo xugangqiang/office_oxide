@@ -12,6 +12,17 @@
 
 use super::fib::Fib;
 
+/// The deepest outline level MS-DOC stores: `Heading 1`–`Heading 9`
+/// (`sprmPOutlineLvl` operand, `StdfBase.sti`, and a `Heading N` style name all
+/// use this range). Shared so every site that validates or derives a level reads
+/// the same bound — see [`MAX_HEADING_DEPTH`] for the IR-side clamp.
+pub const MAX_OUTLINE_LEVEL: u8 = 9;
+/// The deepest heading level the IR can express. `Heading::level` is a 1-6
+/// markdown-style depth, so MS-DOC outline levels above this clamp here at the
+/// IR boundary (`convert_doc`), matching the DOCX path's
+/// `(outline_level + 1).min(6)`.
+pub const MAX_HEADING_DEPTH: u8 = 6;
+
 /// One style definition, indexed by `istd`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StyleDef {
@@ -48,7 +59,7 @@ pub fn parse_style_sheet(table_stream: &[u8], fib: &Fib) -> Vec<StyleDef> {
 pub fn heading_level_for_istd(styles: &[StyleDef], istd: u16) -> Option<u8> {
     let s = styles.get(istd as usize)?;
     // Built-in heading styles: `sti` 1..9 == Heading 1..9.
-    if (1..=9).contains(&s.sti) {
+    if (1..=u16::from(MAX_OUTLINE_LEVEL)).contains(&s.sti) {
         return Some(s.sti as u8);
     }
     // User-defined heading styles are named "Heading N".
@@ -69,7 +80,7 @@ fn heading_level_from_name(name: &str) -> Option<u8> {
     let primary = lowered.split(',').next().unwrap_or("");
     let rest = primary.trim().strip_prefix("heading ")?;
     let level: u8 = rest.trim().parse().ok()?;
-    if (1..=9).contains(&level) {
+    if (1..=MAX_OUTLINE_LEVEL).contains(&level) {
         Some(level)
     } else {
         None

@@ -366,22 +366,27 @@ mod tests {
         }
     }
 
-    /// Regression: MS-DOC outline levels run 1–9 but `Heading::level` is a
-    /// 1–6 markdown depth, so a deeply-nested heading must clamp to 6 rather
-    /// than emitting an out-of-contract level.
+    /// Regression: MS-DOC outline levels run to `MAX_OUTLINE_LEVEL` but
+    /// `Heading::level` is a 1..=MAX_HEADING_DEPTH markdown depth, so a
+    /// deeply-nested heading must clamp at the IR boundary rather than emitting
+    /// an out-of-contract level.
     #[test]
-    fn ir_deep_outline_level_clamps_to_six() {
+    fn ir_deep_outline_level_clamps_to_ir_max_depth() {
+        use crate::doc::styles::{MAX_HEADING_DEPTH, MAX_OUTLINE_LEVEL};
         use crate::ir::Element;
         let doc = make_doc_with_paragraphs(vec![pap(
             "Deep section",
             crate::doc::sprm::PapProps {
-                heading_level: Some(9),
+                heading_level: Some(MAX_OUTLINE_LEVEL),
                 ..Default::default()
             },
         )]);
         let ir = crate::convert_doc::doc_to_ir(&doc);
         match &ir.sections[0].elements[0] {
-            Element::Heading(h) => assert_eq!(h.level, 6, "outline level 9 must clamp to 6"),
+            Element::Heading(h) => assert_eq!(
+                h.level, MAX_HEADING_DEPTH,
+                "outline level {MAX_OUTLINE_LEVEL} must clamp to {MAX_HEADING_DEPTH}"
+            ),
             other => panic!("expected a Heading, got {:?}", other),
         }
     }
