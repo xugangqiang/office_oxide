@@ -392,12 +392,13 @@ mod tests {
         // 2 (the `elements.is_empty() ? 1 : 2` rule in `emit_prose`). This is
         // the regression test for deriving heading levels from paragraph style
         // rather than the line heuristic.
+        use crate::doc::OutlineLevel;
         let doc = make_doc_with_paragraphs(vec![
             pap("Intro paragraph.", Default::default()),
             pap(
                 "Subsection",
                 crate::doc::sprm::PapProps {
-                    outline_level: Some(2),
+                    outline_level: Some(OutlineLevel::Heading(2)),
                     ..Default::default()
                 },
             ),
@@ -420,12 +421,13 @@ mod tests {
     #[test]
     fn ir_deep_outline_level_clamps_to_ir_max_depth() {
         use crate::doc::MAX_OUTLINE_LEVEL;
+        use crate::doc::OutlineLevel;
         use crate::ir::Element;
         use crate::ir::MAX_HEADING_DEPTH;
         let doc = make_doc_with_paragraphs(vec![pap(
             "Deep section",
             crate::doc::sprm::PapProps {
-                outline_level: Some(MAX_OUTLINE_LEVEL - 1),
+                outline_level: Some(OutlineLevel::Heading(MAX_OUTLINE_LEVEL - 1)),
                 ..Default::default()
             },
         )]);
@@ -887,20 +889,16 @@ mod tests {
         );
     }
 
-    /// Regression: a heading resolved from the *style sheet* must **not**
-    /// switch the line-shape guess off for the rest of the document.
+    /// A level resolved from the *style sheet* switches the line-shape guess
+    /// off for the whole document, exactly as one resolved from `sprmPOutLvl`
+    /// does: `has_structured_headings` means "resolved a level from either
+    /// source".
     ///
     /// The body line here is short and ALL-CAPS with no trailing '.', i.e.
-    /// exactly the shape the guess turns into a heading. Measured on a real
-    /// corpus, letting a style-derived level flip `has_structured_headings`
-    /// collapsed `parentinvguid.doc` from 35 headings to 2: the document
-    /// styled only a few paragraphs and left its 33 section headings as plain
-    /// ALL-CAPS lines, and switching the guess off lost every one of them.
-    ///
-    /// Style-derived levels give the paragraphs that carry them their real
-    /// level; they are not evidence that the whole document is structured.
+    /// exactly the shape the guess turns into a heading on its own — so its
+    /// coming out as prose is evidence about the gate, not about the line shape.
     #[test]
-    fn styled_heading_does_not_switch_off_the_line_shape_guess() {
+    fn style_derived_heading_switches_off_the_line_shape_guess() {
         use crate::ir::Element;
 
         let doc_bytes = build_synthetic_styled_doc("SHORT ALL CAPS BODY LINE");
@@ -918,16 +916,11 @@ mod tests {
             .collect();
         assert_eq!(
             headings.len(),
-            2,
-            "the styled heading must keep its real level *and* the unstyled ALL-CAPS \
-             line must still be recognised; got {elements:?}"
+            1,
+            "the ALL-CAPS line must not be guessed once the document has a real \
+             (style-derived) heading; got {elements:?}"
         );
-        // The styled one is still Heading 3 — the level came from the style
-        // sheet, which is the point of the change.
-        assert!(
-            headings.iter().any(|h| h.level == 3),
-            "the style-derived level must still be used"
-        );
+        assert_eq!(headings[0].level, 3, "the one heading is the styled one, at its real level");
     }
 
     #[test]

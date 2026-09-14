@@ -1,4 +1,4 @@
-use crate::doc::{DocDocument, DocParagraph, TapCellInfo, TapInfo};
+use crate::doc::{DocDocument, DocParagraph, OutlineLevel, TapCellInfo, TapInfo};
 use crate::format::DocumentFormat;
 use crate::ir::*;
 
@@ -34,7 +34,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // for their neighbours.
     let has_structured_headings = paragraphs
         .iter()
-        .any(|p| p.props.outline_lvl_explicit && p.props.outline_level.is_some());
+        .any(|p| matches!(p.props.outline_level, Some(OutlineLevel::Heading(_))));
     if !paragraphs.is_empty() {
         walk_paragraphs(paragraphs, has_structured_headings, &mut elements);
     } else {
@@ -463,7 +463,14 @@ fn walk_paragraphs(
             flush_list(&mut list_items, elements);
             match p.props.outline_level {
                 // A real outline level: use it, and never guess alongside it.
-                Some(lvl) => emit_heading(&p.text, lvl + 1, elements),
+                Some(OutlineLevel::Heading(lvl)) => emit_heading(&p.text, lvl + 1, elements),
+                // Explicitly marked body text: never a heading, even when the
+                // paragraph's style is a heading style.
+                Some(OutlineLevel::BodyText) => elements.push(Element::Paragraph(Paragraph {
+                    content: inline_content_for(&p.text),
+                    tabs: p.props.tabs.clone(),
+                    ..Default::default()
+                })),
                 None if has_structured_headings => {
                     elements.push(Element::Paragraph(Paragraph {
                         content: inline_content_for(&p.text),
@@ -856,7 +863,7 @@ mod tests {
             props: PapProps {
                 is_table_trailing_mark: true,
                 itap: 1,
-                outline_level: Some(2),
+                outline_level: Some(OutlineLevel::Heading(2)),
                 ..PapProps::default()
             },
         };
@@ -865,7 +872,7 @@ mod tests {
             terminator: '\u{7}', // closes the cell
             props: PapProps {
                 f_in_table: true,
-                outline_level: Some(2),
+                outline_level: Some(OutlineLevel::Heading(2)),
                 ..PapProps::default()
             },
         };
@@ -912,7 +919,7 @@ mod tests {
             props: PapProps {
                 is_table_trailing_mark: true,
                 itap: 1,
-                outline_level: Some(1),
+                outline_level: Some(OutlineLevel::Heading(1)),
                 ..PapProps::default()
             },
         };
@@ -948,7 +955,7 @@ mod tests {
             props: PapProps {
                 ilfo: Some(1),
                 ilvl: Some(0),
-                outline_level: Some(3),
+                outline_level: Some(OutlineLevel::Heading(3)),
                 ..PapProps::default()
             },
         };

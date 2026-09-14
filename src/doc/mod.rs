@@ -32,6 +32,7 @@ pub use document::{DocDocument, SubDocument, SubDocumentKind};
 pub use error::{DocError, Result};
 pub use images::{DocImage, ImageFormat};
 pub(crate) use papx::DocParagraph;
+pub use sprm::OutlineLevel;
 pub(crate) use sprm::{TapCellInfo, TapInfo};
 // `PapProps` is only needed by unit tests inside this crate, so the re-export
 // is test-gated to avoid an unused-import warning in non-test builds.

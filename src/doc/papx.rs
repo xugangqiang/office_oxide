@@ -17,6 +17,7 @@
 //! The `grpprl` is decoded by [`super::sprm::extract_pap_props`].
 
 use super::piece_table::{Piece, decode_cp_range, sanitize_text};
+use super::sprm::OutlineLevel;
 use super::sprm::PapProps;
 use super::styles::{StyleDef, heading_level_for_istd};
 
@@ -313,16 +314,17 @@ fn piece_byte_base(p: &Piece) -> (u32, u32) {
 /// - absent, or carrying an operand that is not a valid outline level → fall
 ///   back to the paragraph's style, `istd`, which the caller has already
 ///   resolved from the PAPX header and any `sprmPIstd` (0x4600) override.
-fn resolve_outline_level(props: &PapProps, istd: u16, styles: &[StyleDef]) -> Option<u8> {
-    if props.outline_lvl_explicit {
-        // Settled by direct formatting: either a real level or an explicit
-        // body-text marker (`None`). `extract_pap_props` already stored it.
-        props.outline_level
-    } else {
-        // `heading_level_for_istd` is 1-based (Heading 1–9); the field is
-        // zero-based. The level is at least 1 whenever it is `Some`, so this
-        // cannot underflow.
-        heading_level_for_istd(styles, istd).map(|level| level - 1)
+fn resolve_outline_level(props: &PapProps, istd: u16, styles: &[StyleDef]) -> Option<OutlineLevel> {
+    match props.outline_level {
+        // Direct formatting settled it: either a real level or an explicit
+        // body-text marker. `BodyText` is returned as-is rather than collapsed
+        // to `None`, because "explicitly not a heading" and "no opinion" are
+        // not the same thing once a style could supply a level.
+        Some(level) => Some(level),
+        // No direct formatting, so ask the style. `heading_level_for_istd` is
+        // 1-based (Heading 1–9) and `OutlineLevel::Heading` is zero-based; the
+        // level is at least 1 whenever it is `Some`, so this cannot underflow.
+        None => heading_level_for_istd(styles, istd).map(|level| OutlineLevel::Heading(level - 1)),
     }
 }
 
@@ -611,7 +613,7 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(2),
+            Some(OutlineLevel::Heading(2)),
             "built-in Heading style must resolve to its level"
         );
     }
@@ -651,7 +653,7 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(2),
+            Some(OutlineLevel::Heading(2)),
             "`sprmPIstd` override must win over the PAPX `istd`"
         );
     }
@@ -685,7 +687,7 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(2),
+            Some(OutlineLevel::Heading(2)),
             "user-defined `heading N` name must resolve to its level"
         );
     }
@@ -716,7 +718,7 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(4),
+            Some(OutlineLevel::Heading(4)),
             "`sprmPOutLvl` must set the heading level directly"
         );
     }
@@ -754,7 +756,7 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(4),
+            Some(OutlineLevel::Heading(4)),
             "`sprmPOutLvl` must override the style-derived level"
         );
     }
@@ -870,7 +872,8 @@ mod tests {
         let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
         assert_eq!(paras.len(), 1);
         assert_eq!(
-            paras[0].props.outline_level, None,
+            paras[0].props.outline_level,
+            Some(OutlineLevel::BodyText),
             "an explicit body-text marker (operand 0x09) must suppress the style-derived heading"
         );
     }
@@ -899,7 +902,7 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(MAX_OUTLINE_LEVEL - 1),
+            Some(OutlineLevel::Heading(MAX_OUTLINE_LEVEL - 1)),
             "the outline SPRM accepts the full 1..=MAX_OUTLINE_LEVEL range; clamping to \
              the IR depth is the IR boundary's job, not this one"
         );
@@ -995,7 +998,7 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(2),
+            Some(OutlineLevel::Heading(2)),
             "heading must resolve from a style sheet obtained via parse_style_sheet"
         );
     }

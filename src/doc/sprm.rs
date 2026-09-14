@@ -237,21 +237,30 @@ pub struct PapProps {
     /// fields encoding the same level at different offsets have to be kept in
     /// step by hand, and a caller that sets only one of them silently loses the
     /// level.
-    pub outline_level: Option<u8>,
+    pub outline_level: Option<OutlineLevel>,
     /// The style index this paragraph is restyled to by a direct `sprmPIstd`
     /// (0x4600) in the grpprl, if any. It overrides the PAPX header's own
     /// `istd` when resolving the style (see `crate::doc::styles`); `None` means
     /// the PAPX header `istd` applies unchanged.
     pub style_istd: Option<u16>,
-    /// True when the grpprl carries a `sprmPOutLvl` (0x2640) whose operand is a
-    /// valid outline level (0x00–0x09).
-    ///
-    /// This distinguishes "the SPRM is absent" from "the SPRM is present and
-    /// says body text" (operand 0x09): in both cases `outline_level` is `None`,
-    /// but only the latter settles the question — when this flag is set the
-    /// paragraph's style must not be consulted. An operand above 0x09 is not an
-    /// outline level at all, leaves this flag false, and is ignored.
-    pub outline_lvl_explicit: bool,
+}
+
+/// What a paragraph's outline level is, once direct formatting and the style
+/// have been consulted.
+///
+/// `sprmPOutLvl` (0x2640) states a level directly, and it also states *body
+/// text* (operand `0x09`) — which is not the same as saying nothing at all:
+/// a paragraph styled `Heading 3` but marked body text must stay body text
+/// rather than fall through to its style. That difference is why this is one
+/// value with three states and not an `Option<u8>` plus a bool: two fields
+/// that must agree is a state you can get wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutlineLevel {
+    /// A real heading level, in [MS-DOC]'s zero-based space: `0` = Heading 1
+    /// … `8` = Heading 9.
+    Heading(u8),
+    /// `sprmPOutLvl` operand `0x09`: explicitly *not* a heading.
+    BodyText,
 }
 
 /// One table cell descriptor (TKBKTAP, 20 bytes) distilled from a row's
@@ -460,19 +469,18 @@ pap_sprm_dispatch! {
     /// The opcode is 0x2640 — *not* the 0x6412 a byte-swapped reading
     /// suggests, which is `sprmPDyaLine`.
     ///
-    /// `outline_lvl_explicit` records that the SPRM is present with a valid
-    /// operand, so "absent" and "present but body text" stay distinguishable:
-    /// only the latter suppresses a heading the paragraph's style would
-    /// otherwise give it. An operand above 9 is not an outline level at all,
-    /// leaves the flag false, and is ignored.
+    /// `OutlineLevel::BodyText` records that the SPRM is present *and* says
+    /// body text, which is different from the SPRM being absent: only the
+    /// former suppresses a heading the paragraph's style would otherwise give
+    /// it. An operand above 9 is not an outline level at all, so it is ignored
+    /// and `outline_level` is left as `None` — "ask the style".
     "sprmPOutLvl" @ "2.6.2" => [0x2640] (props, operand) {
         if let Some(&lvl) = operand.first() {
             if lvl < OUTLVL_BODY_TEXT {
-                props.outline_lvl_explicit = true;
-                props.outline_level = Some(lvl);
+                props.outline_level = Some(OutlineLevel::Heading(lvl));
             } else if lvl == OUTLVL_BODY_TEXT {
                 // Explicitly body text: settle it, and never consult the style.
-                props.outline_lvl_explicit = true;
+                props.outline_level = Some(OutlineLevel::BodyText);
             }
         }
     }
@@ -701,10 +709,6 @@ mod tests {
         // LSPD: dyaLine = 0x0005, fMultLinespace = 0x0000.
         let props = extract_pap_props(&[0x12, 0x64, 0x05, 0x00, 0x00, 0x00]);
         assert_eq!(props.outline_level, None, "line spacing must never become an outline level");
-        assert!(
-            !props.outline_lvl_explicit,
-            "line spacing must not settle the outline level either"
-        );
     }
 
     /// The `sprmPOutLvl` operand is **zero-based**: `0x00`–`0x08` are Heading
@@ -714,33 +718,34 @@ mod tests {
     #[test]
     fn sprm_p_out_lvl_zero_is_heading_one() {
         let props = extract_pap_props(&[0x40, 0x26, 0x00]);
-        assert_eq!(props.outline_level, Some(0), "0x00 is Heading 1, not body text");
-        assert!(props.outline_lvl_explicit);
+        assert_eq!(
+            props.outline_level,
+            Some(OutlineLevel::Heading(0)),
+            "0x00 is Heading 1, not body text"
+        );
     }
 
     #[test]
     fn sprm_p_out_lvl_eight_is_heading_nine() {
         let props = extract_pap_props(&[0x40, 0x26, 0x08]);
-        assert_eq!(props.outline_level, Some(8), "0x08 is Heading 9");
-        assert!(props.outline_lvl_explicit);
+        assert_eq!(props.outline_level, Some(OutlineLevel::Heading(8)), "0x08 is Heading 9");
     }
 
     #[test]
     fn sprm_p_out_lvl_nine_is_body_text() {
         let props = extract_pap_props(&[0x40, 0x26, 0x09]);
-        assert_eq!(props.outline_level, None, "0x09 means body text, not Heading 9");
-        assert!(
-            props.outline_lvl_explicit,
-            "body text must still settle the question, so the style is never consulted"
+        assert_eq!(
+            props.outline_level,
+            Some(OutlineLevel::BodyText),
+            "0x09 means body text, not Heading 9, and must still settle the question"
         );
     }
 
     #[test]
     fn sprm_p_out_lvl_above_nine_is_not_an_outline_level() {
         let props = extract_pap_props(&[0x40, 0x26, 0x0A]);
-        assert_eq!(props.outline_level, None);
-        assert!(
-            !props.outline_lvl_explicit,
+        assert_eq!(
+            props.outline_level, None,
             "an operand above 0x09 is not an outline level and must not settle anything"
         );
     }
