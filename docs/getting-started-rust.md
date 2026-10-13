@@ -8,7 +8,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-office_oxide = "0.1.12"
+office_oxide = "0.1.14"
 ```
 
 ### Feature Flags
@@ -17,13 +17,13 @@ office_oxide = "0.1.12"
 [dependencies]
 # Default build — read support for all six formats; write/edit support
 # for DOCX, XLSX, PPTX.
-office_oxide = "0.1.12"
+office_oxide = "0.1.14"
 
 # Memory-mapped opens for large OOXML files.
-office_oxide = { version = "0.1.12", features = ["mmap"] }
+office_oxide = { version = "0.1.14", features = ["mmap"] }
 
 # Parallel parsing helpers.
-office_oxide = { version = "0.1.12", features = ["parallel"] }
+office_oxide = { version = "0.1.14", features = ["parallel"] }
 ```
 
 ## Quickstart

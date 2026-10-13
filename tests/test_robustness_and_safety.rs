@@ -349,6 +349,90 @@ fn test_deeply_nested_tables_stay_within_the_depth_limit() {
     let _ = doc.to_ir().to_markdown();
 }
 
+/// Text boxes nest the same way tables do — a paragraph's run holds a
+/// shape whose `w:txbxContent` holds paragraphs — but only table nesting
+/// was bounded. The format-specific reader runs on the caller's own stack,
+/// so a deep enough chain overflowed it and aborted the process.
+fn nested_text_boxes(depth: usize, open: &str, close: &str) -> String {
+    let mut body = String::new();
+    for _ in 0..depth {
+        body.push_str(open);
+    }
+    body.push_str("<w:p><w:r><w:t>BURIED</w:t></w:r></w:p>");
+    for _ in 0..depth {
+        body.push_str(close);
+    }
+    body
+}
+
+const VML_BOX_OPEN: &str = "<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent>";
+const VML_BOX_CLOSE: &str = "</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>";
+const DML_BOX_OPEN: &str = "<w:p><w:r><w:drawing><wp:anchor><a:graphic><a:graphicData>\
+    <wps:wsp><wps:txbx><w:txbxContent>";
+const DML_BOX_CLOSE: &str = "</w:txbxContent></wps:txbx></wps:wsp></a:graphicData>\
+    </a:graphic></wp:anchor></w:drawing></w:r></w:p>";
+
+#[test]
+fn test_deeply_nested_text_boxes_do_not_abort_the_process() {
+    for (open, close) in [(VML_BOX_OPEN, VML_BOX_CLOSE), (DML_BOX_OPEN, DML_BOX_CLOSE)] {
+        let bytes = docx_with(&nested_text_boxes(20_000, open, close));
+        // The format-specific reader parses on the caller's stack (the
+        // harness thread's default 2 MiB here), with no larger parse thread
+        // in between.
+        let doc = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone()))
+            .expect("parse");
+        let _ = doc.plain_text();
+        let _ = doc.to_markdown();
+        let doc = open_docx(bytes).expect("parse");
+        let _ = doc.to_ir().to_markdown();
+    }
+}
+
+#[test]
+fn test_text_boxes_inside_tables_nested_to_the_cap_do_not_abort_the_process() {
+    // Both recursions share one budget; the deepest mix the caps allow
+    // must still fit the harness thread's default stack.
+    let tables = office_oxide::core::xml::MAX_NESTING_DEPTH;
+    let mut body = String::new();
+    for _ in 0..tables {
+        body.push_str("<w:tbl><w:tr><w:tc>");
+    }
+    body.push_str(&nested_text_boxes(tables, VML_BOX_OPEN, VML_BOX_CLOSE));
+    for _ in 0..tables {
+        body.push_str("</w:tc></w:tr></w:tbl>");
+    }
+    let bytes = docx_with(&body);
+    let doc =
+        office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone())).expect("parse");
+    let _ = doc.plain_text();
+    let _ = doc.to_markdown();
+    let _ = open_docx(bytes).expect("parse").to_ir().to_markdown();
+}
+
+#[test]
+fn test_text_boxes_nested_past_the_cap_say_so() {
+    let depth = office_oxide::core::xml::MAX_NESTING_DEPTH + 50;
+    for (open, close) in [(VML_BOX_OPEN, VML_BOX_CLOSE), (DML_BOX_OPEN, DML_BOX_CLOSE)] {
+        let doc = open_docx(docx_with(&nested_text_boxes(depth, open, close))).expect("parse");
+        let text = doc.plain_text();
+        assert!(
+            text.contains("document truncated"),
+            "truncation must be visible in the content, got {:?}",
+            &text[..text.len().min(300)]
+        );
+        assert!(!text.contains("BURIED"), "content past the cap was not skipped");
+    }
+}
+
+#[test]
+fn test_text_boxes_nested_below_the_cap_parse_in_full() {
+    for (open, close) in [(VML_BOX_OPEN, VML_BOX_CLOSE), (DML_BOX_OPEN, DML_BOX_CLOSE)] {
+        let bytes = docx_with(&nested_text_boxes(10, open, close));
+        let doc = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes)).expect("parse");
+        assert!(doc.plain_text().contains("BURIED"));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Malformed CFB header
 // ---------------------------------------------------------------------------
@@ -404,7 +488,6 @@ fn test_control_characters_do_not_reach_the_generated_xml() {
             })],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
 
     for fmt in [
@@ -560,7 +643,6 @@ fn test_every_renderer_agrees_on_an_out_of_range_heading_level() {
             })],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
     assert!(ir.to_markdown().starts_with("# Zero"), "markdown: {:?}", ir.to_markdown());
     assert!(ir.to_html().contains("<h1>Zero</h1>"), "html: {}", ir.to_html());
@@ -693,7 +775,6 @@ fn test_adjacent_runs_with_the_same_formatting_are_merged() {
             })],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
     let md = ir.to_markdown();
     assert_eq!(md, "**BOLD_ABOLD_B**", "got {md}");
@@ -723,7 +804,6 @@ fn test_superscript_survives_the_markdown_renderer() {
             })],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
     assert_eq!(ir.to_markdown(), "E=mc<sup>2</sup>");
 }
@@ -749,7 +829,6 @@ fn test_emphasis_delimiters_do_not_wrap_leading_or_trailing_spaces() {
             })],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
     assert_eq!(ir.to_markdown(), " **padded** ");
 }
@@ -785,7 +864,6 @@ fn test_images_can_be_embedded_as_base64_at_their_position_in_the_flow() {
             ],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
 
     // Without the option, images stay out of the markdown entirely.
@@ -823,7 +901,6 @@ fn test_base64_padding_is_correct_for_every_input_length() {
                 })],
                 ..Default::default()
             }],
-            defined_names: Vec::new(),
         };
         let md = ir.to_markdown_with(MarkdownOptions {
             image_embed: ImageEmbed::Base64,
