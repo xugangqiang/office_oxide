@@ -66,6 +66,8 @@ pub(super) fn parse_word2_fib(data: &[u8]) -> Result<Word6Fib> {
 /// The FIB fields the extractor needs, bounded to the stream.
 #[derive(Debug)]
 pub(super) struct Word6Fib {
+    /// `wIdent`: `0xA5DC` for Windows, `0xA697..=0xA699` for the Macintosh variants.
+    pub wident: u16,
     pub lid: u16,
     pub complex: bool,
     /// `fExtChar`: the text is stored in two-byte code units (UTF-16LE)
@@ -80,6 +82,20 @@ pub(super) struct Word6Fib {
     pub ccp: [u32; 8],
     pub fc_clx: u32,
     pub lcb_clx: u32,
+    /// `fcPlcfbtePapx` / `lcbPlcfbtePapx` (at 0xC0 / 0xC4): where the table of
+    /// paragraph-property pages is in the `WordDocument` stream.
+    pub fc_plcf_bte_papx: u32,
+    pub lcb_plcf_bte_papx: u32,
+    /// `pnPapFirst` and `cpnBtePap` (16-bit, at 0x18C and 0x190): the page
+    /// number of the first PAPX page and how many there are. The bin table can
+    /// list fewer than `cpnBtePap`; the rest follow the first in order. Zero
+    /// when the FIB is too short to hold them.
+    pub pn_pap_first: u16,
+    pub cpn_bte_pap: u16,
+    /// `fcPlcfsed` / `lcbPlcfsed` (at 0x88 / 0x8C): the section table, in the
+    /// `WordDocument` stream.
+    pub fc_plcf_sed: u32,
+    pub lcb_plcf_sed: u32,
 }
 
 const FIB_LEN: usize = 0x168;
@@ -105,6 +121,7 @@ pub(super) fn parse_fib(data: &[u8]) -> Result<Word6Fib> {
         *slot = u32_at(0x34 + i * 4);
     }
     Ok(Word6Fib {
+        wident: u16_at(0x00),
         lid: u16_at(0x06),
         complex: flags & 0x0004 != 0,
         ext_char: flags & 0x1000 != 0,
@@ -113,6 +130,16 @@ pub(super) fn parse_fib(data: &[u8]) -> Result<Word6Fib> {
         ccp,
         fc_clx: u32_at(0x160),
         lcb_clx: u32_at(0x164),
+        fc_plcf_bte_papx: u32_at(0xC0),
+        lcb_plcf_bte_papx: u32_at(0xC4),
+        pn_pap_first: data
+            .get(0x18C..0x18E)
+            .map_or(0, |b| u16::from_le_bytes([b[0], b[1]])),
+        cpn_bte_pap: data
+            .get(0x190..0x192)
+            .map_or(0, |b| u16::from_le_bytes([b[0], b[1]])),
+        fc_plcf_sed: u32_at(0x88),
+        lcb_plcf_sed: u32_at(0x8C),
     })
 }
 
@@ -143,6 +170,10 @@ pub(super) fn pieces(word_doc: &[u8], fib: &Word6Fib) -> Result<Vec<Piece>> {
         // shared extractor reads. A piece that points past the stream
         // contributes nothing.
         for piece in &mut pieces {
+            // A piece's property modifier (`Prm1`, naming a `Prc`) is a list of
+            // one-byte Word 6 sprms here. The shared reader takes it for Word
+            // 97's two-byte opcodes, and a misread one can hide a piece's text.
+            piece.prm_grpprl.clear();
             let fc = if piece.is_compressed {
                 (piece.fc & !0x4000_0000) / 2
             } else {
