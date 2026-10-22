@@ -923,6 +923,11 @@ fn render_cell_markdown(cell: &TableCell) -> String {
         .iter()
         .map(|e| match e {
             Element::Paragraph(p) => render_inline_markdown(&p.content),
+            // A GFM table cannot hold a table: the nested table's own `|`
+            // would become columns of the outer one. It is rendered as usual
+            // (which keeps the renderer's depth bound) and its rows are then
+            // written as lines of this cell.
+            Element::Table(_) => nested_table_as_cell_lines(&render_element_markdown(e)),
             other => render_element_markdown(other),
         })
         .collect::<Vec<_>>()
@@ -935,6 +940,70 @@ fn render_cell_markdown(cell: &TableCell) -> String {
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join("<br>")
+}
+
+/// The cells of one rendered GFM row (`| a | b |`), split on the unescaped
+/// pipes.
+fn gfm_row_cells(row: &str) -> Vec<String> {
+    let inner = row.trim().trim_start_matches('|');
+    let mut cells = vec![String::new()];
+    let mut escaped = false;
+    for c in inner.chars() {
+        match c {
+            '\\' if !escaped => {
+                escaped = true;
+                cells.last_mut().expect("never empty").push(c);
+                continue;
+            },
+            '|' if !escaped => cells.push(String::new()),
+            _ => cells.last_mut().expect("never empty").push(c),
+        }
+        escaped = false;
+    }
+    // The row's closing pipe leaves one empty trailing cell.
+    if cells.last().is_some_and(|c| c.trim().is_empty()) {
+        cells.pop();
+    }
+    cells.into_iter().map(|c| c.trim().to_owned()).collect()
+}
+
+/// A rendered nested table as lines for the cell that holds it: its separator
+/// row dropped and each row's cells joined by an escaped pipe, so the outer
+/// table keeps its own columns.
+///
+/// The separator is the second line of a rendered table and nothing else:
+/// recognising it by its look would also drop a data row of `-`, a common
+/// "nil" placeholder, which renders the same way. An empty cell keeps its place
+/// so the columns stay where they were; a row with no text at all is dropped.
+fn nested_table_as_cell_lines(table_md: &str) -> String {
+    let lines: Vec<&str> = table_md.lines().map(str::trim).collect();
+    let is_table = lines.first().is_some_and(|l| l.starts_with('|'))
+        && lines.get(1).is_some_and(|l| is_separator_row(l));
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            if is_table && i == 1 {
+                return None;
+            }
+            if !line.starts_with('|') {
+                return (!line.is_empty()).then(|| (*line).to_owned());
+            }
+            let cells = gfm_row_cells(line);
+            cells
+                .iter()
+                .any(|c| !c.is_empty())
+                .then(|| cells.join(" \\| "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether `line` is the separator row `render_table_markdown` writes
+/// (`| --- | --- |`).
+fn is_separator_row(line: &str) -> bool {
+    let cells = gfm_row_cells(line);
+    !cells.is_empty() && cells.iter().all(|c| c == "---")
 }
 
 fn render_list_markdown(list: &List, indent: usize) -> String {

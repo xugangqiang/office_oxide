@@ -324,6 +324,9 @@ pub struct PapProps {
     /// from its `istd` (so `extract_pap_props` alone leaves it `None`). `None`
     /// also for the default style (`istd` 0) and for a style with no name.
     pub style_name: Option<String>,
+    /// `sprmPFInnerTableCell` (0x244B): the last paragraph of a cell of a
+    /// nested table, which ends in a paragraph mark and not in `\x07`.
+    pub f_inner_table_cell: bool,
     /// List level (0-based) when the paragraph is a list item. `None` when
     /// the paragraph carries no list SPRM. (Reserved for list support; the
     /// `table.doc` fixture has no in-body lists to verify this against.)
@@ -666,11 +669,32 @@ pap_sprm_dispatch! {
         }
     }
 
-    /// 4-byte operand: the table nesting depth.
+    /// 4-byte signed operand: the table nesting depth. An out-of-range value
+    /// saturates to the top of a `u8` instead of being truncated (257 would
+    /// become 1) or clamped to the bottom (a negative depth would become 0): it
+    /// must not pass for an ordinary paragraph, and the top is where the table
+    /// builder reports it.
     "sprmPItap" @ "2.6.2" => [0x6649] (props, operand) {
         if operand.len() >= 4 {
-            let v = u32::from_le_bytes([operand[0], operand[1], operand[2], operand[3]]);
-            props.itap = v as u8;
+            let v = i32::from_le_bytes([operand[0], operand[1], operand[2], operand[3]]);
+            props.itap = u8::try_from(v).unwrap_or(u8::MAX);
+        }
+    }
+
+    /// 1-byte `Bool8` operand, bit 0: this paragraph is the last one of a cell
+    /// of a **nested** table (`itap` >= 2). Word ends such a cell with an
+    /// ordinary paragraph mark carrying this flag; only an outermost cell ends
+    /// with the `\x07` cell mark.
+    "sprmPFInnerTableCell" @ "2.6.2" => [0x244B] (props, operand) {
+        props.f_inner_table_cell = operand.first().is_some_and(|&b| b & 1 != 0);
+    }
+
+    /// 1-byte `Bool8` operand, bit 0: this paragraph ends a row of a
+    /// **nested** table. It is the nested counterpart of `sprmPFTtp`, carried
+    /// by an ordinary paragraph mark together with the row definition.
+    "sprmPFInnerTtp" @ "2.6.2" => [0x244C] (props, operand) {
+        if operand.first().is_some_and(|&b| b & 1 != 0) {
+            props.is_table_trailing_mark = true;
         }
     }
 
@@ -1237,6 +1261,8 @@ mod tests {
         (0x460B, "sprmPIlfo"),
         (0x6412, "sprmPDyaLine"),
         (0x6649, "sprmPItap"),
+        (0x244B, "sprmPFInnerTableCell"),
+        (0x244C, "sprmPFInnerTtp"),
         (0xC60D, "sprmPChgTabsPapx"),
         (0xC615, "sprmPChgTabs"),
         (0xD608, "sprmTDefTable"),
@@ -1585,6 +1611,21 @@ mod tests {
         let mut grpprl = vec![0x13, 0xA4];
         grpprl.extend_from_slice(&0x7BC1u16.to_le_bytes());
         assert_eq!(extract_pap_props(&grpprl).space_before_twips, None);
+    }
+
+    #[test]
+    fn test_a_negative_table_depth_stays_out_of_range_instead_of_becoming_outermost() {
+        // 0x6649 is a signed 4-byte operand. A negative depth is as invalid as
+        // one past 255: both saturate to the top, where the table builder
+        // reports them, and neither passes for an ordinary outermost paragraph.
+        for v in [-1i32, i32::MIN, 256, i32::MAX] {
+            let mut g = vec![0x49, 0x66];
+            g.extend_from_slice(&v.to_le_bytes());
+            assert_eq!(extract_pap_props(&g).itap, u8::MAX, "operand {v}");
+        }
+        let mut g = vec![0x49, 0x66];
+        g.extend_from_slice(&2i32.to_le_bytes());
+        assert_eq!(extract_pap_props(&g).itap, 2);
     }
 
     #[test]
