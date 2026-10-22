@@ -667,7 +667,22 @@ fn is_merge_continuation(pending: &[PendingRow], row: usize, col: usize) -> bool
 fn count_grid_edges(centers: &[i16], col: usize, grid: &[i32]) -> u32 {
     let lo = centers[col] as i32;
     let hi = centers[col + 1] as i32;
-    grid.iter().filter(|&&e| e >= lo && e < hi).count().max(1) as u32
+    // `grid` is sorted, so the edges in `[lo, hi)` are a run found by search;
+    // scanning all of it for every cell is cells x edges.
+    let below = |bound: i32| {
+        grid.partition_point(|&e| {
+            #[cfg(test)]
+            GRID_PROBES.with(|p| p.set(p.get() + 1));
+            e < bound
+        })
+    };
+    below(hi).saturating_sub(below(lo)).max(1) as u32
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many grid edges `count_grid_edges` has compared, on this thread.
+    static GRID_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Walk structured paragraphs in document order, emitting tables, lists,
@@ -2106,5 +2121,65 @@ mod tests {
     #[test]
     fn test_date_substring_inside_otherwise_heading_shaped_text_is_unaffected() {
         assert!(is_heading_guess("Report 11/16/2016 Summary"));
+    }
+
+    fn row_of_cells(centers: Vec<i16>) -> PendingRow {
+        let n = centers.len() - 1;
+        PendingRow {
+            cells: vec![Vec::new(); n],
+            tap: Some(TapInfo {
+                itc_mac: n as u8,
+                centers,
+                cells: vec![TapCellInfo::default(); n],
+            }),
+            header: false,
+        }
+    }
+
+    #[test]
+    fn test_grid_edges_are_counted_by_search_not_by_scanning_the_whole_grid() {
+        // Rows whose boundaries all differ fill the column grid (the i16 twip
+        // range, deduplicated to 4 twips, is ~16k edges). Every cell used to be
+        // checked against every edge: cells x edges, about 640 million
+        // comparisons here. A search compares about 15 edges per bound.
+        let rows: Vec<PendingRow> = (0..400i32)
+            .map(|r| {
+                let centers: Vec<i16> = (0..=100i32)
+                    .map(|k| (-32768 + (k * 640 + r * 5) % 65000) as i16)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                row_of_cells(centers)
+            })
+            .collect();
+        GRID_PROBES.with(|p| p.set(0));
+        let table = build_table_rows(&rows);
+        let probes = GRID_PROBES.with(std::cell::Cell::get);
+        let cells: usize = table.iter().map(|r| r.cells.len()).sum();
+        assert!(cells > 30_000, "{cells} cells");
+        // Two searches per cell, each at most log2(grid) + 1 = 15 probes.
+        assert!(probes > 0 && probes <= cells * 2 * 15, "{probes} probes for {cells} cells");
+        assert_eq!(table.len(), 400);
+    }
+
+    #[test]
+    fn test_grid_edge_count_matches_a_scan_of_the_grid() {
+        let grid = [0, 10, 20, 20, 30, 1000];
+        for (lo, hi) in [
+            (0i16, 10i16),
+            (0, 31),
+            (5, 6),
+            (10, 10),
+            (20, 1000),
+            (-5, 2000),
+            (31, 999),
+        ] {
+            let want = grid
+                .iter()
+                .filter(|&&e| e >= lo as i32 && e < hi as i32)
+                .count()
+                .max(1) as u32;
+            assert_eq!(count_grid_edges(&[lo, hi], 0, &grid), want, "{lo}..{hi}");
+        }
     }
 }
