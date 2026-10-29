@@ -166,7 +166,10 @@ pub fn extract_deck_text(stream: &[u8], current_user: Option<&[u8]>) -> DeckText
 /// The slide-text heuristics used when the persist directory yields no
 /// text: the slide list's inline text cache, then every `Slide` container
 /// in the stream, then every text atom outside the masters and notes.
-fn extract_slides_without_persist(stream: &[u8], budget: &mut downrev::DownrevBudget) -> Vec<SlideText> {
+fn extract_slides_without_persist(
+    stream: &[u8],
+    budget: &mut downrev::DownrevBudget,
+) -> Vec<SlideText> {
     // A best-effort fallback scope for the weaker paths below, which have
     // no persist-resolved DocumentContainer to search within at all.
     let stream_wide_hyperlinks = parse_ex_hyperlinks(stream);
@@ -317,7 +320,11 @@ fn is_field_placeholder_only(text: &str) -> bool {
 /// Returns `None` if the `DocumentContainer` or its slide list can't be
 /// resolved at all (directory present but unusable); returns `Some(vec![])`
 /// if the slide list resolves but is empty.
-fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory, budget: &mut downrev::DownrevBudget) -> Option<DeckText> {
+fn extract_slides_via_persist(
+    stream: &[u8],
+    dir: &PersistDirectory,
+    budget: &mut downrev::DownrevBudget,
+) -> Option<DeckText> {
     let doc_offset = dir.resolve(dir.doc_persist_id)?;
     let doc_children = bounded_container_children(stream, doc_offset, RT_DOCUMENT)?;
     let slide_list = find_child(&doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES)?;
